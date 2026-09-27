@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "MyAgent"
+version = "0.1.0"
+description = "AgentCore Runtime Application using LangChain/LangGraph"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aws-opentelemetry-distro ~= 0.18.0",
+    "bedrock-agentcore >= 1.8.0",
+    "langchain >= 1.0.3",
+    "langchain-aws >= 1.0.0",
+    "langchain-core >= 1.0.0",
+    "langgraph >= 1.0.2",
+    "opentelemetry-instrumentation-langchain >= 0.59.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["model", "tools"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"main.py" = "main.py"

@@ -1,0 +1,18 @@
+# Build context is the repo root. Send only what the image needs.
+*
+!pyproject.toml
+!uv.lock
+!src/agent/
+
+# Python / local artifacts inside the agent
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+**/.venv
+**/dist
+**/build
+**/.pytest_cache
+**/.env
+**/.env.*
+**/.agentcore
+**/Dockerfile*

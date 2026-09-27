@@ -1,0 +1,129 @@
+name: Release agent
+
+# Builds the agent image, publishes it to ECR, then releases it through the
+# AgentCore A/B Release Gate: the new image runs as a treatment next to the
+# current control version and is promoted only if every quality gate passes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/agent/**
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC to assume the AWS deploy role
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: agentcore-release-showcase # infra/ecr.tf (var.project_name)
+  OBSERVATION_SECONDS: 900
+
+jobs:
+  publish:
+    name: Publish image to ECR
+    # AgentCore Runtime needs linux/arm64; build natively instead of emulating.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # Repo root is the context: the image needs the uv workspace lockfile.
+          context: .
+          file: src/agent/Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false # push a single ARM64 manifest, not an index with attestations
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: A/B release gate
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production
+    # One release at a time per Gateway; never cancel a running A/B test.
+    concurrency:
+      group: agentcore-production
+      cancel-in-progress: false
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Must outlast observation + evaluation; the role's MaxSessionDuration must allow it.
+          role-duration-seconds: 14400
+
+      # Only the digest crosses jobs: GitHub drops job outputs containing masked
+      # values, which the registry URI (AWS account ID) can be.
+      - id: image
+        run: |
+          account_id=$(aws sts get-caller-identity --query Account --output text)
+          echo "uri=${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}@${{ needs.publish.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      - uses: alvarog2491/agentcore-ab-release-gate@c3b197619c73e45d395bb3eb9a535ddc464ed254 # v1.1.2
+        with:
+          step: auto
+          image-uri: ${{ steps.image.outputs.uri }}
+          runtime-id: ${{ vars.AGENTCORE_RUNTIME_ID }}
+          gateway-id: ${{ vars.AGENTCORE_GATEWAY_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          evaluation-config-id: ${{ vars.AGENTCORE_EVALUATION_CONFIG_ID }}
+          ab-test-role-arn: ${{ vars.AGENTCORE_AB_TEST_ROLE_ARN }}
+          # Showcase-sized test: 15 min observation, even split so the treatment
+          # collects enough sessions quickly. Production default is 7200 / 80-20.
+          duration-seconds: ${{ env.OBSERVATION_SECONDS }}
+          control-weight: '50'
+          treatment-weight: '50'
+          # Minimum treatment score per evaluator ID (`terraform output tool_usage_evaluator_id`
+          # and `terraform output judge_evaluator_ids`). Gates on tool use and business
+          # accuracy; the explainability and built-in evaluators in the online config
+          # are recorded for both variants but don't block a release.
+          # - tool_usage: 1 if the agent called a tool, else 0 (>= 80% of turns).
+          # - return_policy / order_grounding: LLM judges scoring 1.0 / 0.5 / 0.0.
+          quality-gates: >-
+            {"showcase_agent_tool_usage-tZdZBDE5vH": 0.8,
+            "showcase_agent_return_policy-CUBEYKHrI8": 0.9,
+            "showcase_agent_order_grounding-EiF5HKA6EO": 0.8}
+
+  # The release gate observes real traffic but does not create it. This job
+  # plays customers: it sends questions through the Gateway's control target
+  # while the deploy job prepares the candidate and runs the A/B test.
+  traffic:
+    name: Generate traffic
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      # Observation window plus ~10 min for the gate to deploy the candidate
+      # and create the treatment endpoint before the A/B test starts.
+      - run: scripts/traffic.sh "${{ vars.AGENTCORE_GATEWAY_ID }}" "$AWS_REGION" $((OBSERVATION_SECONDS + 600)) 10

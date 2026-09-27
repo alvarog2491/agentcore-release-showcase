@@ -1,0 +1,18 @@
+[project]
+name = "agentcore-release-showcase"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "alvarog2491", email = "alvarog2491@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "myagent",
+]
+
+[tool.uv.workspace]
+members = ["src/agent"]
+
+[tool.uv.sources]
+myagent = { workspace = true }
