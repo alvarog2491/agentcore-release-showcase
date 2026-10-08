@@ -40,16 +40,9 @@ variable "bedrock_model_id" {
 }
 
 variable "judge_model_id" {
-  description = "Bedrock foundation model ID the custom LLM-as-a-judge evaluators use. A different, larger model than the agent's."
+  description = "Bedrock foundation model ID the on-demand LLM-as-a-judge evaluator uses. A different, larger model than the agent's."
   type        = string
   default     = "openai.gpt-oss-120b-1:0"
-}
-
-
-variable "monitored_builtin_evaluators" {
-  description = "Built-in evaluators added to the online evaluation config for monitoring. The config holds at most 10 evaluators, 7 of them custom."
-  type        = list(string)
-  default     = ["Builtin.Helpfulness", "Builtin.Faithfulness", "Builtin.ToolSelectionAccuracy"]
 }
 
 variable "evaluation_sampling_percentage" {

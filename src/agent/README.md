@@ -13,7 +13,7 @@ file defines a Starlette ASGI app with the LangChain/LangGraph framework running
 
 `model/load.py` instantiates your chosen model provider.
 
-The runtime returns buffered JSON in the form `{"result": "non-empty text"}`. Tool usage is scored by the deterministic evaluator in `src/evaluators/tool_usage.py`.
+The runtime returns buffered JSON in the form `{"result": "non-empty text"}`. Each turn is scored against the store's support workflow by the deterministic evaluator in `src/evaluators/support_workflow.py`.
 
 ## Input Validation
 

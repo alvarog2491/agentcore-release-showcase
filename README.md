@@ -6,15 +6,17 @@ AgentCore agent with the
 GitHub Action. Use it as a template: replace the agent, the change you release
 and the evaluators with your own, and the same flow applies.
 
-- **Release.** A new agent image is promoted only when it scores at least as
-  well as the current version in a live A/B test.
-- **Evaluate.** The released agent is evaluated on demand for helpfulness,
-  business accuracy and explainability, following the three-layer approach from
-  the AWS Machine Learning blog post
-  [Evaluating multi-agent systems for explainability and helpfulness with Amazon Bedrock AgentCore](https://aws.amazon.com/blogs/machine-learning/evaluating-multi-agent-systems-for-explainability-and-helpfulness-with-amazon-bedrock-agentcore/).
+- **Release.** A new agent image is promoted only when it scores better than
+  the current version in a live A/B test, and rolled back otherwise.
+- **Gate.** A deterministic, code-based evaluator scores every agent turn
+  against the store's support workflow: look facts up, invent no order,
+  tracking or return numbers, never ask the customer for a SKU, and check
+  eligibility before opening a return.
 
 The example agent is a customer-support assistant for a fictitious online
-store. The full walkthrough, with results from real runs, is in
+store. The walkthrough releases a latency optimization that skips the
+eligibility check (rolled back), then a prompt fix (promoted). The full
+walkthrough, with results from real runs, is in
 [`docs/devto-agentcore-release-and-evaluation.md`](docs/devto-agentcore-release-and-evaluation.md).
 
 ## Layout
@@ -22,10 +24,10 @@ store. The full walkthrough, with results from real runs, is in
 | Path | What it is |
 |---|---|
 | `src/agent/` | The agent: LangGraph + Bedrock, served with the AgentCore Runtime SDK. |
-| `src/evaluators/` | The release gate's code-based evaluator (Lambda). |
-| `infra/` | Terraform for the AWS resources the action needs, plus custom evaluators. |
+| `src/evaluators/` | The release gate's code-based evaluator (Lambda) and its tests. |
+| `infra/` | Terraform for the AWS resources the action needs, plus the evaluators. |
 | `scripts/` | Traffic generation, test sessions and on-demand evaluations. |
-| `docs/` | The dev.to post: releasing the agent with the A/B release gate and evaluating it. |
+| `docs/` | The dev.to post: releasing the agent with the A/B release gate. |
 
 ## Infrastructure
 
@@ -37,12 +39,13 @@ store. The full walkthrough, with results from real runs, is in
 - **AgentCore Gateway** (HTTP, IAM auth) with a **`control` target** that routes
   to the control endpoint. During a release, the action adds a `treatment`
   endpoint and target and splits Gateway traffic between them.
-- **A deterministic tool-usage evaluator**: a Lambda
-  (`src/evaluators/tool_usage.py`) that scores each agent turn 1 if it called a
-  tool and 0 if not, plus the **online evaluation configuration** the action
-  uses to score control and treatment with it.
-- **Six custom LLM-as-a-judge evaluators** (`infra/evaluators.tf`) for on-demand
-  evaluation. See [Evaluations](#evaluations).
+- **A deterministic support-workflow evaluator**: a Lambda
+  (`src/evaluators/support_workflow.py`) that scores each agent turn 1 if it
+  follows the store's support workflow and 0 if it breaks a rule, plus the
+  **online evaluation configuration** the action uses to score control and
+  treatment with it.
+- **One LLM-as-a-judge evaluator** (`infra/evaluators.tf`) for on-demand
+  evaluation of the facts the rules can't check. See [Evaluations](#evaluations).
 
 Terraform bootstraps these resources. After that, the action owns the Runtime
 image and the endpoint versions, and Terraform ignores changes to them.
@@ -77,8 +80,8 @@ account (`eu-central-1` by default).
    workflow (`AWS_REGION`, `AWS_DEPLOY_ROLE_ARN`, `AGENTCORE_RUNTIME_ID`,
    `AGENTCORE_GATEWAY_ID`, `AGENTCORE_EVALUATION_CONFIG_ID`,
    `AGENTCORE_AB_TEST_ROLE_ARN`), create a `production` environment, and set
-   the evaluator ID from `terraform output tool_usage_evaluator_id` in the
-   workflow's `quality-gates`.
+   the evaluator ID from `terraform output support_workflow_evaluator_id` in
+   the workflow's `quality-gates`.
 
 4. Set `github_oidc_sub_prefix` to your repository's OIDC subject prefix if you
    use a fork:
@@ -92,25 +95,75 @@ account (`eu-central-1` by default).
 [`.github/workflows/release.yml`](.github/workflows/release.yml) runs on every
 push to `main` that changes the agent. It publishes a new ARM64 image to ECR,
 then the release gate A/B tests it against the current version. The gate
-promotes the image when the agent used its tools in at least 80% of treatment
-turns, and rolls it back otherwise.
+promotes the image when at least 90% of treatment turns follow the support
+workflow and the treatment scores significantly better than the control, and
+rolls it back otherwise.
 
 The action only observes traffic. `scripts/traffic.sh` plays the customers
 during the observation period; in production, your users generate the traffic.
 
+## The three agent versions
+
+The walkthrough uses three versions of `DEFAULT_SYSTEM_PROMPT` in
+`src/agent/main.py`. The repository contains version 3.
+
+Version 1, the bootstrap image. It asks customers for SKUs in some return
+requests:
+
+```python
+DEFAULT_SYSTEM_PROMPT = """
+You are a customer-support assistant for an online electronics store.
+Always use the available tools to answer — never guess order, shipping or
+return information from your own knowledge.
+- To find a customer's orders from their email, use find_customer_orders.
+- To see items, SKUs, prices and dates of an order, use get_order_details.
+- For "where is my order" questions, use track_shipment.
+- Before promising a return, use check_return_eligibility; only call
+  create_return when the customer asks for it and the item is eligible.
+If you are missing an email, order ID or item, ask the customer for it.
+"""
+```
+
+Version 2, a latency optimization of version 1 that the gate rolls back. It
+opens returns without checking eligibility first:
+
+```python
+DEFAULT_SYSTEM_PROMPT = """
+You are a customer-support assistant for an online electronics store.
+Customers hate waiting: keep replies short and use as few tool calls as
+possible.
+- To find a customer's orders from their email, use find_customer_orders.
+- To see items, SKUs, prices and dates of an order, use get_order_details.
+- For "where is my order" questions, use track_shipment.
+- When the customer asks for a return, call create_return directly: it
+  checks eligibility itself, so check_return_eligibility is an extra step.
+If you are missing an email, order ID or item, ask the customer for it.
+"""
+```
+
+Version 3, in the repository, reads SKUs from the order instead of asking the
+customer for them. The gate promotes it over version 1.
+
 ## Evaluations
 
-`infra/evaluators.tf` creates six TRACE-level LLM-as-a-judge evaluators that
-complete the three layers:
+The release gate uses one evaluator, `showcase_agent_support_workflow`
+(TRACE level). A turn scores 0 when it breaks any of these rules:
 
-| Layer | Evaluators |
+| Rule | A turn fails when |
 |---|---|
-| 1. General quality | Built-in: `Builtin.Helpfulness`, `Builtin.ToolSelectionAccuracy`, `Builtin.Faithfulness`, `Builtin.GoalSuccessRate` |
-| 2. Business accuracy | `return_policy`, `order_grounding` |
-| 3. Explainability | `decision_rationale`, `evidence_attribution`, `policy_reasoning`, `assumption_disclosure` |
+| Look it up | It states order facts and no tool was called in the session |
+| No invented identifiers | It contains an order ID, tracking number or RMA number that no customer message or tool result contains |
+| Don't make the customer do the lookup | It asks the customer for a SKU without having read the order |
+| Check before acting | It calls `create_return` without an earlier `check_return_eligibility` for the same item |
 
-They run on demand only, outside the online evaluation config, so releases use
-the tool-usage evaluator alone.
+```bash
+python -m unittest discover src/evaluators
+```
+
+`infra/evaluators.tf` adds `showcase_agent_order_grounding`, an
+LLM-as-a-judge evaluator that checks whether every order fact in an answer
+(dates, prices, statuses) comes from a tool result. It runs on demand only,
+outside the online evaluation config:
 
 ```bash
 # Multi-turn test sessions (orders, shipping, returns); prints the session IDs
@@ -119,7 +172,7 @@ uv run scripts/test_agent.py --runtime-arn "$(terraform -chdir=infra output -raw
 # Wait 3-5 minutes for the spans to reach CloudWatch, then:
 uv run scripts/evaluate.py --runtime-id "$(terraform -chdir=infra output -raw runtime_id)" \
   --session-id <session-id> \
-  --evaluators showcase_agent_return_policy,Builtin.Helpfulness,Builtin.ToolSelectionAccuracy
+  --evaluators showcase_agent_order_grounding,Builtin.Faithfulness
 ```
 
 Reports are saved under `results/` (gitignored).

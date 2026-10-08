@@ -205,14 +205,7 @@ data "aws_iam_policy_document" "evaluation" {
   statement {
     sid       = "InvokeEvaluatorLambda"
     actions   = ["lambda:InvokeFunction", "lambda:GetFunction"]
-    resources = [aws_lambda_function.tool_usage_evaluator.arn]
-  }
-
-  # Judge model of the custom LLM-as-a-judge evaluators in the online config.
-  statement {
-    sid       = "InvokeJudgeModel"
-    actions   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
-    resources = ["arn:${local.partition}:bedrock:${var.aws_region}::foundation-model/${var.judge_model_id}"]
+    resources = [aws_lambda_function.support_workflow_evaluator.arn]
   }
 }
 

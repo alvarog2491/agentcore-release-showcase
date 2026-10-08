@@ -96,16 +96,15 @@ jobs:
           duration-seconds: ${{ env.OBSERVATION_SECONDS }}
           control-weight: '50'
           treatment-weight: '50'
-          # Minimum treatment score per evaluator ID (`terraform output tool_usage_evaluator_id`
-          # and `terraform output judge_evaluator_ids`). Gates on tool use and business
-          # accuracy; the explainability and built-in evaluators in the online config
-          # are recorded for both variants but don't block a release.
-          # - tool_usage: 1 if the agent called a tool, else 0 (>= 80% of turns).
-          # - return_policy / order_grounding: LLM judges scoring 1.0 / 0.5 / 0.0.
+          # Scores arrive in batches minutes after a session ends; wait for the
+          # sample count to stay stable for 5 min so most sessions are counted.
+          scoring-lag-seconds: '300'
+          # Minimum treatment score per evaluator ID (`terraform output support_workflow_evaluator_id`).
+          # support_workflow scores each turn 1 if it follows the store's support
+          # workflow (looks facts up, invents no IDs, never asks for a SKU, checks
+          # eligibility before create_return), else 0: >= 90% of treatment turns.
           quality-gates: >-
-            {"showcase_agent_tool_usage-tZdZBDE5vH": 0.8,
-            "showcase_agent_return_policy-CUBEYKHrI8": 0.9,
-            "showcase_agent_order_grounding-EiF5HKA6EO": 0.8}
+            {"showcase_agent_support_workflow-6D9E4mCaGA": 0.9}
 
   # The release gate observes real traffic but does not create it. This job
   # plays customers: it sends questions through the Gateway's control target
@@ -125,5 +124,6 @@ jobs:
           role-duration-seconds: 3600
 
       # Observation window plus ~10 min for the gate to deploy the candidate
-      # and create the treatment endpoint before the A/B test starts.
-      - run: scripts/traffic.sh "${{ vars.AGENTCORE_GATEWAY_ID }}" "$AWS_REGION" $((OBSERVATION_SECONDS + 600)) 10
+      # and create the treatment endpoint before the A/B test starts. Four
+      # parallel customers give each variant enough sessions for significance.
+      - run: scripts/traffic.sh "${{ vars.AGENTCORE_GATEWAY_ID }}" "$AWS_REGION" $((OBSERVATION_SECONDS + 600)) 5 4

@@ -7,12 +7,12 @@ whole session (SESSION level) as the evaluator requires. Results are printed
 and saved as a Markdown report under results/<session-id>/<timestamp>/.
 
 Evaluators can be built-in IDs (Builtin.Helpfulness), custom evaluator IDs
-(showcase_agent_return_policy-AbCdEf1234) or custom evaluator names
-(showcase_agent_return_policy), which are resolved to their IDs.
+(showcase_agent_order_grounding-AbCdEf1234) or custom evaluator names
+(showcase_agent_order_grounding), which are resolved to their IDs.
 
 Usage:
     uv run scripts/evaluate.py --runtime-id <runtime-id> --session-id <session-id> \
-        --evaluators Builtin.Helpfulness,showcase_agent_return_policy
+        --evaluators Builtin.Helpfulness,showcase_agent_order_grounding
 """
 
 import argparse

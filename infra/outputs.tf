@@ -37,14 +37,14 @@ output "evaluation_config_id" {
   value       = aws_bedrockagentcore_online_evaluation_config.control.online_evaluation_config_id
 }
 
-output "tool_usage_evaluator_id" {
-  description = "Custom code-based evaluator ID (key in the workflow's quality gates)"
-  value       = aws_bedrockagentcore_evaluator.tool_usage.evaluator_id
+output "support_workflow_evaluator_id" {
+  description = "Release gate evaluator ID (key in the workflow's quality gates)"
+  value       = aws_bedrockagentcore_evaluator.support_workflow.evaluator_id
 }
 
-output "judge_evaluator_ids" {
-  description = "Custom LLM-as-a-judge evaluator IDs for scripts/evaluate.py, by short name"
-  value       = { for name, evaluator in aws_bedrockagentcore_evaluator.judge : name => evaluator.evaluator_id }
+output "order_grounding_evaluator_id" {
+  description = "On-demand LLM-as-a-judge evaluator ID for scripts/evaluate.py"
+  value       = aws_bedrockagentcore_evaluator.order_grounding.evaluator_id
 }
 
 output "ab_test_role_arn" {
