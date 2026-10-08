@@ -502,12 +502,13 @@ Outputs:
 ab_test_role_arn              = "arn:aws:iam::123456789012:role/agentcore-release-showcase-ab-test"
 aws_region                    = "eu-central-1"
 control_endpoint_name         = "control"
-evaluation_config_id          = "<TODO: from the run>"
-gateway_id                    = "<TODO: from the run>"
+ecr_repository_url            = "123456789012.dkr.ecr.eu-central-1.amazonaws.com/agentcore-release-showcase"
+evaluation_config_id          = "showcase_agent_control_eval-TIuENTGKTP"
+gateway_id                    = "agentcore-release-showcase-gateway-tbxw0u5whz"
 github_deploy_role_arn        = "arn:aws:iam::123456789012:role/agentcore-release-showcase-github-deploy"
-order_grounding_evaluator_id  = "<TODO: from the run>"
-runtime_id                    = "<TODO: from the run>"
-support_workflow_evaluator_id = "<TODO: from the run>"
+order_grounding_evaluator_id  = "showcase_agent_order_grounding-EiF5HKA6EO"
+runtime_id                    = "showcase_agent-5d8CQj7PYA"
+support_workflow_evaluator_id = "showcase_agent_support_workflow-6D9E4mCaGA"
 ```
 
 2. Generate traffic against version 1. `scripts/traffic.sh` sends customer questions to the gateway, one new session per request, signed with SigV4. Each request is the following `curl` call, where `$url` is `https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/control/invocations`:
@@ -522,18 +523,22 @@ status=$(curl -sS -o /tmp/traffic-response.json -w '%{http_code}' --max-time 120
   -d "$body" -X POST "$url") || status=000
 ```
 
-<!-- TODO: replace with one minute of real traffic against version 1 and its scores. -->
+The script takes the gateway ID, the Region, the duration, the pause between requests and the number of parallel customers. The following output shows 40 seconds of traffic against version 1 with two customers (the script prints only the beginning of each answer):
 
 ```text
-$ scripts/traffic.sh <gateway-id> eu-central-1 60 5
-TODO
+$ scripts/traffic.sh agentcore-release-showcase-gateway-tbxw0u5whz eu-central-1 40 5 2
+[w1 1] Can I return the headphones from order ORD-1001? -> Sure! The HD‑200 Wireless Headphones in order **ORD‑1001** are still return‑eligible. You can return them anytime up to **10 Oct 2026** for a full ref
+[w0 1] Hi, I'm ana@example.com. Where is my keyboard? -> Your mechanical keyboard (order ORD‑1002) is on its way!   - **Tracking number:** JD014600003456789012 (DHL)   - **Estimated delivery:** 29 September 20
+[w1 2] I'm ben@example.com, I want to return my monitor. -> I’m sorry, but the 30‑day return window for the 27‑inch Monitor (SKU: MN‑270) closed on **2026‑09‑02**.    Because that date has passed, you’re
+[w0 2] Please open a return for the USB-C cable in ORD-1001, it doesn't charge my phone. -> Great news! Your return has been processed.  * **Return ID**: **RMA‑5001**   * **Item**: USB‑C Cable (SKU CB‑010)   * **Reason**:
+...
+Worker 1 sent 4 requests, 0 failed.
+Worker 0 sent 5 requests, 0 failed.
 ```
 
-3. Wait a few minutes for online evaluation to score the sessions. Version 1 follows the workflow in most turns and fails the return requests where it asks for a SKU:
+Version 1 reads the data: the DHL tracking number, the return window of the monitor and the RMA number all come from the tools. The first answer also shows why the release gate needs more than rules on identifiers: the return deadline of the headphones is 2026-10-14, not 10 October. That kind of error is what the on-demand judge at the end of this post is for.
 
-```text
-TODO: online evaluation results for version 1
-```
+3. Wait a few minutes for online evaluation to score the sessions. Every session is scored by the template configuration, so you can check the baseline before the first release. Version 1 follows the workflow in most turns and fails the return requests where it asks for a SKU; the control column of the first release below shows its scores on 191 turns.
 
 ## Configure the release workflow
 
@@ -721,84 +726,298 @@ jobs:
 
 ## Release version 2: rolled back
 
-With version 2 in `DEFAULT_SYSTEM_PROMPT`, a push to `main` starts the release. The control is version 1.
+With version 2 in `DEFAULT_SYSTEM_PROMPT`, a push to `main` starts the release. The control serves version 1.
 
-<!-- TODO: fill from the release run of version 2. -->
+The runtime numbers its versions on every image update, and they don't match the agent versions of this post. In our account, runtime version 1 was an earlier bootstrap image, version 1 of the agent ran as runtime version 2, and the release created runtime version 3 for agent version 2.
 
 The following table shows how the run progressed (times in UTC):
 
 | Time | Event |
 |---|---|
-| TODO | `publish` starts |
-| TODO | `treatment` endpoint and target ready, candidate deployed |
-| TODO | The A/B test is running, 50/50 |
-| TODO | End of the 900 seconds of observation |
-| TODO | Results stable, quality gate failed |
-| TODO | Candidate rolled back |
+| 08:30:29 | `publish` starts. Build and push take 81 seconds |
+| 08:32:03 | The action resolves the image digest |
+| 08:32:05 | The `treatment` endpoint and gateway target from an earlier release are reused |
+| 08:32:06 | New image deployed as runtime version 3 |
+| 08:32:27 | `treatment` moves to runtime version 3, `control` stays on runtime version 2 |
+| 08:32:50 | One evaluation configuration per variant is ready |
+| 08:33:02 | The A/B test is running, 50/50 |
+| 08:48:02 | End of the 900 seconds of observation |
+| 08:49:02 | First results: 27 treatment and 18 control sessions scored |
+| 09:18:02 | Final results: 208 treatment and 172 control sessions; the gate fails |
+| 09:18:55 | Candidate rolled back |
 
 The following are the main lines of the action's log:
 
 ```text
-TODO
+08:32:03 {"event": "candidate-image-resolved", "image": "123456789012.dkr.ecr.eu-central-1.amazonaws.com/agentcore-release-showcase@sha256:4ecb76f76daf15dbb36de65687420bb14743a35bc83d43009995932da32cea0e", "observationSeconds": 900}
+08:32:05 {"event": "deployment-prepared", "baseline": "2", "runtime": "showcase_agent-5d8CQj7PYA", "gateway": "agentcore-release-showcase-gateway-tbxw0u5whz"}
+08:32:06 {"event": "candidate-runtime-created", "version": "3"}
+08:32:27 {"event": "treatment-endpoint-serving", "endpoint": "treatment", "version": "3"}
+08:32:28 {"event": "evaluation-config-created", "variant": "control", "evaluationConfigId": "showcase_agent_control_eval_c_aa7922b6-STy4x45q5z"}
+08:32:39 {"event": "evaluation-config-created", "variant": "treatment", "evaluationConfigId": "showcase_agent_control_eval_t_13afb08c-3AwTuh8Kay"}
+08:32:51 {"event": "ab-test-created", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553"}
+08:33:02 {"event": "ab-test-running", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553"}
+08:48:02 {"event": "evaluation-results-waiting", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553"}
+08:49:02 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 60, "remainingSeconds": 1739, "totalSamplesScored": 27, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+…  (a 'stabilizing-results' line every 30 s while scores arrive)
+09:18:02 {"event": "ab-test-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "results": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "isSignificant": true, "absoluteChange": -0.2753801431127012, "percentChange": -29.789550072568936, "pValue": 6.291833366249719e-09, "treatmentSampleSize": 208, "controlSampleSize": 172}}}
+09:18:55 Rolled back: control retains version 2
 ```
 
-{% details The full log of the action %}
+{% details The full log of the action (120 events) %}
 ```text
-TODO
+08:32:03 {"event": "candidate-image-resolved", "image": "123456789012.dkr.ecr.eu-central-1.amazonaws.com/agentcore-release-showcase@sha256:4ecb76f76daf15dbb36de65687420bb14743a35bc83d43009995932da32cea0e", "observationSeconds": 900}
+08:32:03 {"event": "deployment-preparing", "controlEndpoint": "control"}
+08:32:04 {"event": "treatment-endpoint-existing", "endpoint": "treatment"}
+08:32:05 {"event": "treatment-endpoint-ready", "endpoint": "treatment"}
+08:32:05 {"event": "gateway-target-existing", "target": "control"}
+08:32:05 {"event": "gateway-target-ready", "target": "control", "targetId": "1FXXBFSC0Y"}
+08:32:05 {"event": "gateway-target-existing", "target": "treatment"}
+08:32:05 {"event": "gateway-target-ready", "target": "treatment", "targetId": "RULIRM0A1H"}
+08:32:05 {"event": "deployment-prepared", "baseline": "2", "runtime": "showcase_agent-5d8CQj7PYA", "gateway": "agentcore-release-showcase-gateway-tbxw0u5whz"}
+08:32:05 {"event": "candidate-runtime-creating", "image": "123456789012.dkr.ecr.eu-central-1.amazonaws.com/agentcore-release-showcase@sha256:4ecb76f76daf15dbb36de65687420bb14743a35bc83d43009995932da32cea0e"}
+08:32:06 {"event": "candidate-runtime-created", "version": "3"}
+08:32:16 {"event": "candidate-runtime-ready", "version": "3"}
+08:32:16 {"event": "treatment-endpoint-updating", "endpoint": "treatment", "version": "3"}
+08:32:27 {"event": "treatment-endpoint-serving", "endpoint": "treatment", "version": "3"}
+08:32:27 {"event": "evaluation-config-template-loading", "evaluationConfigId": "showcase_agent_control_eval-TIuENTGKTP"}
+08:32:27 {"event": "evaluation-config-creating", "variant": "control"}
+08:32:28 {"event": "evaluation-config-created", "variant": "control", "evaluationConfigId": "showcase_agent_control_eval_c_aa7922b6-STy4x45q5z"}
+08:32:28 {"event": "evaluation-config-waiting", "variant": "control", "evaluationConfigId": "showcase_agent_control_eval_c_aa7922b6-STy4x45q5z", "status": "CREATING"}
+08:32:38 {"event": "evaluation-config-ready", "variant": "control", "evaluationConfigId": "showcase_agent_control_eval_c_aa7922b6-STy4x45q5z"}
+08:32:38 {"event": "evaluation-config-creating", "variant": "treatment"}
+08:32:39 {"event": "evaluation-config-created", "variant": "treatment", "evaluationConfigId": "showcase_agent_control_eval_t_13afb08c-3AwTuh8Kay"}
+08:32:39 {"event": "evaluation-config-waiting", "variant": "treatment", "evaluationConfigId": "showcase_agent_control_eval_t_13afb08c-3AwTuh8Kay", "status": "CREATING"}
+08:32:50 {"event": "evaluation-config-ready", "variant": "treatment", "evaluationConfigId": "showcase_agent_control_eval_t_13afb08c-3AwTuh8Kay"}
+08:32:50 {"event": "ab-test-creating", "controlWeight": 50, "treatmentWeight": 50, "gatewayArn": "arn:aws:bedrock-agentcore:eu-central-1:123456789012:gateway/agentcore-release-showcase-gateway-tbxw0u5whz"}
+08:32:51 {"event": "ab-test-created", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553"}
+08:33:02 {"event": "ab-test-running", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553"}
+08:33:02 {"event": "listening-for-connections", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "observationSeconds": 900, "message": "A/B test is running; waiting for Gateway connections and evaluator results."}
+08:33:32 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 30, "remainingSeconds": 870, "abTestStatus": "RUNNING"}
+08:34:02 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 60, "remainingSeconds": 840, "abTestStatus": "RUNNING"}
+08:34:32 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 90, "remainingSeconds": 810, "abTestStatus": "RUNNING"}
+08:35:02 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 120, "remainingSeconds": 780, "abTestStatus": "RUNNING"}
+08:35:32 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 150, "remainingSeconds": 750, "abTestStatus": "RUNNING"}
+08:36:03 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 180, "remainingSeconds": 720, "abTestStatus": "RUNNING"}
+08:36:33 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 210, "remainingSeconds": 690, "abTestStatus": "RUNNING"}
+08:37:03 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 241, "remainingSeconds": 659, "abTestStatus": "RUNNING"}
+08:37:33 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 271, "remainingSeconds": 629, "abTestStatus": "RUNNING"}
+08:38:03 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 301, "remainingSeconds": 599, "abTestStatus": "RUNNING"}
+08:38:34 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 331, "remainingSeconds": 569, "abTestStatus": "RUNNING"}
+08:39:04 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 362, "remainingSeconds": 538, "abTestStatus": "RUNNING"}
+08:39:34 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 392, "remainingSeconds": 508, "abTestStatus": "RUNNING"}
+08:40:04 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 422, "remainingSeconds": 478, "abTestStatus": "RUNNING"}
+08:40:34 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 452, "remainingSeconds": 448, "abTestStatus": "RUNNING"}
+08:41:05 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 482, "remainingSeconds": 418, "abTestStatus": "RUNNING"}
+08:41:35 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 513, "remainingSeconds": 387, "abTestStatus": "RUNNING"}
+08:42:05 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 543, "remainingSeconds": 357, "abTestStatus": "RUNNING"}
+08:42:35 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 573, "remainingSeconds": 327, "abTestStatus": "RUNNING"}
+08:43:05 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 603, "remainingSeconds": 297, "abTestStatus": "RUNNING"}
+08:43:36 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 633, "remainingSeconds": 267, "abTestStatus": "RUNNING"}
+08:44:06 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 663, "remainingSeconds": 237, "abTestStatus": "RUNNING"}
+08:44:36 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 694, "remainingSeconds": 206, "abTestStatus": "RUNNING"}
+08:45:06 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 724, "remainingSeconds": 176, "abTestStatus": "RUNNING"}
+08:45:36 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 754, "remainingSeconds": 146, "abTestStatus": "RUNNING"}
+08:46:06 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 784, "remainingSeconds": 116, "abTestStatus": "RUNNING"}
+08:46:37 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 814, "remainingSeconds": 86, "abTestStatus": "RUNNING"}
+08:47:07 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 845, "remainingSeconds": 55, "abTestStatus": "RUNNING"}
+08:47:37 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 875, "remainingSeconds": 25, "abTestStatus": "RUNNING"}
+08:48:02 {"event": "observing", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 900, "remainingSeconds": 0, "abTestStatus": "RUNNING"}
+08:48:02 {"event": "evaluation-results-waiting", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553"}
+08:48:02 {"event": "waiting-for-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 0, "remainingSeconds": 1799, "totalSamplesScored": 0, "evaluatorsReady": [], "evaluatorsWaiting": ["showcase_agent_support_workflow-6D9E4mCaGA"], "partialResults": {}}
+08:48:32 {"event": "waiting-for-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 30, "remainingSeconds": 1769, "totalSamplesScored": 0, "evaluatorsReady": [], "evaluatorsWaiting": ["showcase_agent_support_workflow-6D9E4mCaGA"], "partialResults": {}}
+08:49:02 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 60, "remainingSeconds": 1739, "totalSamplesScored": 27, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:49:32 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 90, "remainingSeconds": 1709, "totalSamplesScored": 27, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:50:03 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 120, "remainingSeconds": 1679, "totalSamplesScored": 27, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:50:33 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 150, "remainingSeconds": 1649, "totalSamplesScored": 27, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:51:03 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 181, "remainingSeconds": 1618, "totalSamplesScored": 27, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:51:33 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 211, "remainingSeconds": 1588, "totalSamplesScored": 27, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:52:03 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 241, "remainingSeconds": 1558, "totalSamplesScored": 27, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:52:33 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 271, "remainingSeconds": 1528, "totalSamplesScored": 27, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:53:04 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 301, "remainingSeconds": 1498, "totalSamplesScored": 27, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:53:34 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 331, "remainingSeconds": 1468, "totalSamplesScored": 27, "stableForSeconds": 271, "remainingScoringLagSeconds": 28, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.7037037037037037, "treatmentSamples": 27, "controlSamples": 18, "pValue": 0.34901600461362947}}}
+08:54:04 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 362, "remainingSeconds": 1437, "totalSamplesScored": 61, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:54:34 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 392, "remainingSeconds": 1407, "totalSamplesScored": 61, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:55:04 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 422, "remainingSeconds": 1377, "totalSamplesScored": 61, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:55:34 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 452, "remainingSeconds": 1347, "totalSamplesScored": 61, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:56:05 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 482, "remainingSeconds": 1317, "totalSamplesScored": 61, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:56:35 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 512, "remainingSeconds": 1287, "totalSamplesScored": 61, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:57:05 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 543, "remainingSeconds": 1256, "totalSamplesScored": 61, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:57:35 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 573, "remainingSeconds": 1226, "totalSamplesScored": 61, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:58:05 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 603, "remainingSeconds": 1196, "totalSamplesScored": 61, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:58:35 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 633, "remainingSeconds": 1166, "totalSamplesScored": 61, "stableForSeconds": 271, "remainingScoringLagSeconds": 28, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.5737704918032787, "treatmentSamples": 61, "controlSamples": 44, "pValue": 0.0001149945455902997}}}
+08:59:06 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 663, "remainingSeconds": 1136, "totalSamplesScored": 99, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+08:59:36 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 694, "remainingSeconds": 1105, "totalSamplesScored": 99, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+09:00:06 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 724, "remainingSeconds": 1075, "totalSamplesScored": 99, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+09:00:36 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 754, "remainingSeconds": 1045, "totalSamplesScored": 99, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+09:01:06 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 784, "remainingSeconds": 1015, "totalSamplesScored": 99, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+09:01:36 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 814, "remainingSeconds": 985, "totalSamplesScored": 99, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+09:02:07 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 844, "remainingSeconds": 955, "totalSamplesScored": 99, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+09:02:37 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 875, "remainingSeconds": 924, "totalSamplesScored": 99, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+09:03:07 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 905, "remainingSeconds": 894, "totalSamplesScored": 99, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+09:03:37 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 935, "remainingSeconds": 864, "totalSamplesScored": 99, "stableForSeconds": 271, "remainingScoringLagSeconds": 28, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6464646464646465, "treatmentSamples": 99, "controlSamples": 67, "pValue": 0.00017551537736039635}}}
+09:04:07 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 965, "remainingSeconds": 834, "totalSamplesScored": 146, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:04:37 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 995, "remainingSeconds": 804, "totalSamplesScored": 146, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:05:08 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1025, "remainingSeconds": 774, "totalSamplesScored": 146, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:05:38 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1056, "remainingSeconds": 743, "totalSamplesScored": 146, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:06:08 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1086, "remainingSeconds": 713, "totalSamplesScored": 146, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:06:38 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1116, "remainingSeconds": 683, "totalSamplesScored": 146, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:07:08 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1146, "remainingSeconds": 653, "totalSamplesScored": 146, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:07:39 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1176, "remainingSeconds": 623, "totalSamplesScored": 146, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:08:09 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1207, "remainingSeconds": 592, "totalSamplesScored": 146, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:08:39 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1237, "remainingSeconds": 562, "totalSamplesScored": 146, "stableForSeconds": 271, "remainingScoringLagSeconds": 28, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6506849315068494, "treatmentSamples": 146, "controlSamples": 109, "pValue": 1.9215642261708763e-07}}}
+09:09:09 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1267, "remainingSeconds": 532, "totalSamplesScored": 202, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:09:39 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1297, "remainingSeconds": 502, "totalSamplesScored": 202, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:10:09 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1327, "remainingSeconds": 472, "totalSamplesScored": 202, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:10:40 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1357, "remainingSeconds": 442, "totalSamplesScored": 202, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:11:10 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1387, "remainingSeconds": 412, "totalSamplesScored": 202, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:11:40 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1418, "remainingSeconds": 381, "totalSamplesScored": 202, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:12:10 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1448, "remainingSeconds": 351, "totalSamplesScored": 202, "stableForSeconds": 180, "remainingScoringLagSeconds": 119, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:12:40 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1478, "remainingSeconds": 321, "totalSamplesScored": 202, "stableForSeconds": 210, "remainingScoringLagSeconds": 89, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:13:10 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1508, "remainingSeconds": 291, "totalSamplesScored": 202, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:13:40 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1538, "remainingSeconds": 261, "totalSamplesScored": 202, "stableForSeconds": 271, "remainingScoringLagSeconds": 28, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6534653465346535, "treatmentSamples": 202, "controlSamples": 156, "pValue": 4.629157118792766e-08}}}
+09:14:10 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1568, "remainingSeconds": 231, "totalSamplesScored": 208, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "treatmentSamples": 208, "controlSamples": 172, "pValue": 6.291833366249719e-09}}}
+09:14:41 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1598, "remainingSeconds": 201, "totalSamplesScored": 208, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "treatmentSamples": 208, "controlSamples": 172, "pValue": 6.291833366249719e-09}}}
+09:15:11 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1628, "remainingSeconds": 171, "totalSamplesScored": 208, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "treatmentSamples": 208, "controlSamples": 172, "pValue": 6.291833366249719e-09}}}
+09:15:41 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1659, "remainingSeconds": 140, "totalSamplesScored": 208, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "treatmentSamples": 208, "controlSamples": 172, "pValue": 6.291833366249719e-09}}}
+09:16:11 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1689, "remainingSeconds": 110, "totalSamplesScored": 208, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "treatmentSamples": 208, "controlSamples": 172, "pValue": 6.291833366249719e-09}}}
+09:16:41 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1719, "remainingSeconds": 80, "totalSamplesScored": 208, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "treatmentSamples": 208, "controlSamples": 172, "pValue": 6.291833366249719e-09}}}
+09:17:11 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1749, "remainingSeconds": 50, "totalSamplesScored": 208, "stableForSeconds": 180, "remainingScoringLagSeconds": 119, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "treatmentSamples": 208, "controlSamples": 172, "pValue": 6.291833366249719e-09}}}
+09:17:41 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "elapsedSeconds": 1779, "remainingSeconds": 20, "totalSamplesScored": 208, "stableForSeconds": 210, "remainingScoringLagSeconds": 89, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "treatmentSamples": 208, "controlSamples": 172, "pValue": 6.291833366249719e-09}}}
+09:18:02 {"event": "ab-test-results", "abTestId": "agentcore_release_gate_d68bfb89-497f74b553", "results": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 0.6490384615384616, "isSignificant": true, "absoluteChange": -0.2753801431127012, "percentChange": -29.789550072568936, "pValue": 6.291833366249719e-09, "treatmentSampleSize": 208, "controlSampleSize": 172}}}
+09:18:55 Rolled back: control retains version 2
 ```
 {% enddetails %}
 
 During the test, each endpoint served its own version. The following output lists the endpoints as (name, live version, target version, status) and the gateway targets:
 
 ```text
-TODO
+endpoints: [('treatment', '3', None, 'READY'), ('control', '2', None, 'READY'), ('DEFAULT', '3', None, 'READY')]
+targets: ['control', 'treatment']
 ```
 
-`DEFAULT` always follows the latest version, so it was already on the candidate. Route users through the gateway.
+`DEFAULT` always follows the latest runtime version, so it was already on the candidate. Route users through the gateway.
 
 The following JSON shows the A/B test created by the action, from `GetABTest` (shortened):
 
 ```json
-TODO
+{
+  "abTestId": "agentcore_release_gate_d68bfb89-497f74b553",
+  "executionStatus": "RUNNING",
+  "variants": [
+    {"name": "C",  "weight": 50, "variantConfiguration": {"target": {"name": "control"}}},
+    {"name": "T1", "weight": 50, "variantConfiguration": {"target": {"name": "treatment"}}}
+  ],
+  "gatewayFilter": {"targetPaths": ["/control/*"]},
+  "evaluationConfig": {
+    "perVariantOnlineEvaluationConfig": [
+      {"name": "C",  "onlineEvaluationConfigArn": "arn:aws:bedrock-agentcore:eu-central-1:123456789012:online-evaluation-config/showcase_agent_control_eval_c_aa7922b6-STy4x45q5z"},
+      {"name": "T1", "onlineEvaluationConfigArn": "arn:aws:bedrock-agentcore:eu-central-1:123456789012:online-evaluation-config/showcase_agent_control_eval_t_13afb08c-3AwTuh8Kay"}
+    ]
+  }
+}
 ```
 
-Clients keep calling `/control/invocations`, and the gateway decides for each session which target answers.
+Clients keep calling `/control/invocations`, and the gateway decides for each session which target answers. The traffic job sent 601 requests in 25 minutes. 15 of them failed: 11 with HTTP 424 (the runtime returned a 500 when the model produced an invalid tool name) and 4 with a client timeout.
 
-The following answers from the traffic job show the same return request answered by each variant:
+The following answers to "Please open a return for the USB-C cable in ORD-1001, it doesn't charge my phone." come from the runtime logs of each endpoint (shortened). The control checked eligibility and opened the return. The treatment opened it directly in some sessions and asked the customer for the SKU in others:
 
 ```text
-TODO
+control:   ✅ A return has been opened for the USB‑C Cable (SKU: CB‑010) in order ORD‑1001.
+           * Return reference: RMA‑5001 * Reason: It doesn't charge your phone. ...
+treatment: Return RMA‑5001 created for the CB‑010 USB‑C cable. A prepaid label is sent to
+           your email, and the €12.50 refund will be processed once the item arrives ...
+treatment: Could you let me know the SKU of the USB‑C cable in order ORD‑1001?
+treatment: I'm sorry, but the "USB-C cable" isn't listed in order ORD‑1001. Could you let me
+           know the exact SKU of the cable you'd like to return?
 ```
+
+The last answer is wrong as well as unhelpful: the cable is in the order, and the treatment never read it.
 
 ## Interpreting the release results
 
 Every turn is scored on its own. The following are two result records, one from each variant (shortened):
 
 ```json
-TODO
+{
+  "service.name": "showcase_agent.treatment",
+  "attributes": {
+    "gen_ai.evaluation.name": "showcase_agent_support_workflow",
+    "gen_ai.evaluation.score.value": 0.0,
+    "gen_ai.evaluation.score.label": "FAIL",
+    "gen_ai.evaluation.explanation": "The agent asked the customer for a SKU instead of reading the order with get_order_details. create_return was called for ORD-1001 USB-C CABLE without check_return_eligibility first.",
+    "aws.bedrock_agentcore.evaluation_level": "Trace",
+    "aws.bedrock_agentcore.experiment.treatment_name": "T1",
+    "aws.bedrock_agentcore.experiment.arn": "arn:aws:bedrock-agentcore:eu-central-1:123456789012:ab-test/agentcore_release_gate_d68bfb89-497f74b553"
+  }
+}
+```
+
+```json
+{
+  "service.name": "showcase_agent.control",
+  "attributes": {
+    "gen_ai.evaluation.name": "showcase_agent_support_workflow",
+    "gen_ai.evaluation.score.value": 1.0,
+    "gen_ai.evaluation.score.label": "PASS",
+    "gen_ai.evaluation.explanation": "The turn follows the support workflow (tool calls: track_shipment).",
+    "aws.bedrock_agentcore.evaluation_level": "Trace",
+    "aws.bedrock_agentcore.experiment.treatment_name": "C",
+    "aws.bedrock_agentcore.experiment.arn": "arn:aws:bedrock-agentcore:eu-central-1:123456789012:ab-test/agentcore_release_gate_d68bfb89-497f74b553"
+  }
+}
 ```
 
 The `experiment.treatment_name` field (`C` or `T1`) tells AgentCore which variant a score belongs to. The AgentCore SDK (v1.8 or later) adds it to the spans from headers that the gateway sends, so the agent code needs no changes.
 
+The following table counts the scored turns by rule, from the evaluation result log groups of both variants. It includes 19 control turns that were scored after the action's decision. A turn can break more than one rule:
+
+| | Control (version 1) | Treatment (version 2) |
+|---|---|---|
+| Turns that passed | 176 | 135 |
+| Turns that failed | 15 | 73 |
+| Asked the customer for a SKU | 14 | 44 |
+| `create_return` without `check_return_eligibility` | 0 | 32 |
+| Invented identifier | 1 | 0 |
+
+The evaluation results also contain 202 turns without a score. In 197 of them, AgentCore Evaluations couldn't invoke the evaluator Lambda function (`ThrottlingException: Rate Exceeded`), and in 5 the trace had no agent turn. The account's Lambda concurrency quota was the default of 10 for new accounts, and online evaluation invokes the function for a whole batch of sessions at once. Throttled turns are not retried and not counted, so they reduce the sample size but don't bias the result.
+
 The following result is the one the action used for its decision:
 
 ```json
-TODO
+"evaluatorMetrics": [{
+  "evaluatorArn": "arn:aws:bedrock-agentcore:eu-central-1:123456789012:evaluator/showcase_agent_support_workflow-6D9E4mCaGA",
+  "controlStats": {"variantName": "C", "sampleSize": 172, "mean": 0.924},
+  "variantResults": [{
+    "variantName": "T1",
+    "sampleSize": 208,
+    "mean": 0.649,
+    "absoluteChange": -0.275,
+    "percentChange": -29.8,
+    "pValue": 6.29e-09,
+    "confidenceInterval": {"lower": -0.352, "upper": -0.199},
+    "isSignificant": true
+  }]
+}]
 ```
 
-<!-- TODO: treatment mean vs threshold 0.9, control mean, p-value, absolute change; which gate condition failed. -->
+Treatment scored 0.649, below the threshold of 0.9, and 0.275 lower than the control's 0.924. The difference is significant (p-value 6.3e-9), so the result isn't noise: version 2 is worse. Two gate conditions failed, the minimum score and the no-regression check, and the action rolled the candidate back. The numbers match the local comparison (0.88 and 0.62) closely.
 
-The action stopped the A/B test, moved `treatment` back to the control's version, and deleted the temporary evaluation configurations. Users stayed on version 1, except for the sessions that the A/B test routed to the treatment during the observation.
+The action stopped the A/B test, moved `treatment` back to the control's runtime version, and deleted the temporary evaluation configurations. Users stayed on version 1, except for the sessions that the A/B test routed to the treatment while it ran.
 
 ```text
-TODO: endpoints after the rollback
+endpoints: [('treatment', '2', None, 'READY'), ('control', '2', None, 'READY'), ('DEFAULT', '3', None, 'READY')]
+ab tests: [('agentcore_release_gate_d68bfb89-497f74b553', 'ACTIVE', 'STOPPED'), ...]
+eval configs left: ['showcase_agent_control_eval-TIuENTGKTP']
 ```
 
 The release workflow fails when the gate fails, so the commit that introduced version 2 shows a failed check on GitHub. The A/B test stays in AgentCore for later inspection.
 
+The decision came at 09:18:02, exactly 30 minutes after the observation ended, which is the default `evaluation-timeout-seconds`. Online evaluation scored new sessions in batches about every 5 minutes, so the sample count never stayed unchanged for the full 300 seconds of `scoring-lag-seconds`. When the timeout expires and every evaluator has results, the action decides on the latest results instead of failing, so the decision used all 380 scored sessions.
+
 ## Release version 3: promoted
 
-Version 3 replaces version 2 in the repository, so the next push undoes the latency change and adds the SKU fix in one release. The control is still version 1.
+Version 3 replaces version 2 in the repository, so the next push undoes the latency change and adds the SKU fix in one release. The control still serves version 1.
 
 <!-- TODO: fill from the release run of version 3. -->
 
@@ -878,11 +1097,12 @@ The showcase surfaced the following lessons:
 - **Measure a candidate locally before you release it.** Running both prompts against the same questions with the evaluator's rules showed, in minutes, whether the A/B test could detect the difference. A difference smaller than what the observation window can measure leads to a rollback for lack of significance, not for quality.
 - **With significance required, only improvements get promoted.** A candidate as good as the control is rolled back. Turn off `require-significance` if you want to release changes that only have to not be worse.
 - **Send traffic through the gateway during the test.** The action scores only the sessions that go through the gateway while the test runs, and it promotes only with scored sessions.
-- **Scores arrive late.** A session is scored after it has been idle for the configured timeout (2 minutes here), plus processing time. For a real release, keep the default of 2 hours.
+- **Scores arrive late, in batches.** A session is scored after it has been idle for the configured timeout (2 minutes here), plus processing time, and online evaluation delivers the scores in batches about every 5 minutes. With `scoring-lag-seconds` at 300, the count never stayed stable long enough, and the action decided at its 30-minute evaluation timeout with all the scored sessions. For a real release, keep the default observation of 2 hours.
+- **Raise the Lambda concurrency quota for code-based evaluators.** Online evaluation invokes the evaluator for a whole batch of sessions at once. With the default quota of 10 concurrent executions for new accounts, about a third of the evaluations were throttled and never scored. Request a higher quota in Service Quotas (Lambda, Concurrent executions) before you rely on a code-based gate.
 - **Quality gates need full evaluator IDs.** The suffix changes if you recreate the evaluator.
 - **Names around the control endpoint must contain `control`**, because the action builds the treatment names by replacing it with `treatment`.
 - **Terraform must ignore the runtime image and the endpoint version**, or it undoes the releases.
-- **Size the traffic for the difference you expect.** Version 3 is better than version 1 by about 0.1 on a 0-to-1 score. With one customer sending a question every 10 seconds, each variant gets only a few scored sessions in 15 minutes, too few for a significant result, so we run four customers in parallel.
+- **Size the traffic for the difference you expect.** Version 3 is better than version 1 by about 0.1 on a 0-to-1 score. With one customer sending a question every 10 seconds, each variant gets only a few scored sessions in 15 minutes, too few for a significant result. With four customers in parallel, the rollback decision used 380 scored sessions.
 - **Failed requests are invisible to the evaluator.** Requests fail when the model returns an invalid tool name. They produce no answer to score, so a version that fails more often isn't penalized by a quality evaluator. Watch the error rate separately.
 
 For production, we recommend the following:
