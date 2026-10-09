@@ -1,8 +1,7 @@
-# Deterministic release gate: a code-based evaluator backed by a Lambda
+# Deterministic evaluation: a code-based evaluator backed by a Lambda
 # (src/evaluators/support_workflow.py) that scores each agent turn 1.0 if it
-# follows the store's support workflow and 0.0 if it breaks a rule. No LLM
-# judge involved. Plus the online evaluation config the release gate uses as
-# its template.
+# follows the store's support workflow and 0.0 if it breaks a rule. Plus the
+# online evaluation config that scores the control endpoint with it.
 
 locals {
   support_workflow_evaluator_name = "${var.agent_name}_support_workflow"
@@ -90,7 +89,7 @@ resource "aws_bedrockagentcore_evaluator" "support_workflow" {
   depends_on = [aws_lambda_permission.agentcore_evaluations]
 }
 
-# --- Online evaluation config (release gate template) ---
+# --- Online evaluation config ---
 
 # Runtime log groups are created by AgentCore on the first invocation.
 # Pre-create the control one so the evaluation config can point at it
@@ -100,9 +99,8 @@ resource "aws_cloudwatch_log_group" "control_runtime" {
   retention_in_days = 30
 }
 
-# Template for the release gate (action input evaluation-config-id). The gate
-# copies it per variant, replacing the control endpoint name with "treatment"
-# in the service and log group names below, so both must contain it.
+# Online evaluation of the control endpoint: scores every session of the agent
+# with the support-workflow evaluator.
 resource "aws_bedrockagentcore_online_evaluation_config" "control" {
   online_evaluation_config_name = "${var.agent_name}_${var.control_endpoint_name}_eval"
   description                   = "Evaluation of the control endpoint; template for A/B releases"
@@ -116,8 +114,6 @@ resource "aws_bedrockagentcore_online_evaluation_config" "control" {
     }
   }
 
-  # Every evaluator in the workflow's quality-gates must be here. Each extra
-  # evaluator scores every session of both variants, so keep only the gate.
   evaluator {
     evaluator_id = aws_bedrockagentcore_evaluator.support_workflow.evaluator_id
   }
@@ -135,7 +131,7 @@ resource "aws_bedrockagentcore_online_evaluation_config" "control" {
   lifecycle {
     precondition {
       condition     = !strcontains(var.agent_name, var.control_endpoint_name)
-      error_message = "agent_name must not contain control_endpoint_name: the release gate replaces it with \"treatment\" in the service and log group names."
+      error_message = "agent_name must not contain control_endpoint_name."
     }
   }
 

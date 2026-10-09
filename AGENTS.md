@@ -36,8 +36,8 @@ promotes or rolls them back.
   read the real prefix with
   `gh api repos/<owner>/<repo>/actions/oidc/customization/sub`.
 - The infrastructure is applied by hand with local Terraform state
-  (`infra/terraform.tfstate`, gitignored), never from GitHub Actions; see the
-  README.
+  (`infra/terraform.tfstate`, gitignored), never from GitHub Actions; the post's
+  "Deploy the solution" section has the steps.
 - `scripts/traffic.sh`: sends customer questions through the Gateway (SigV4)
   so the A/B test has sessions to score. Used by the workflow's `traffic` job
   and for local smoke tests.
@@ -50,9 +50,12 @@ promotes or rolls them back.
   written in the style of the AWS Machine Learning blog (prose and tables, no
   generated diagrams). Sections marked `TODO` wait for real release runs; never
   fill them with invented numbers.
-- `README.md` holds the version 1 (baseline) and version 2 (latency edit,
-  rolled back) prompts the post uses; the repository's `DEFAULT_SYSTEM_PROMPT`
-  is version 3 (SKU fix, promoted).
+- `README.md` is a short, descriptive page: the purpose of the showcase, the
+  release results, the repository contents and a link to the post. It gives
+  no instructions; setup steps live in the post.
+  The post shows the version 1 (baseline) and version 2 (latency edit, rolled
+  back) prompts; the repository's `DEFAULT_SYSTEM_PROMPT` is version 3 (SKU
+  fix, promoted).
 
 ## Tooling
 

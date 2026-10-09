@@ -1,35 +1,52 @@
 ---
 title: "Gating AI agent releases on Amazon Bedrock AgentCore with A/B tests and a code-based evaluator"
 published: false
-description: "Promote a new agent version only after it beats the current one on live traffic, and roll back a plausible-looking regression automatically, with Amazon Bedrock AgentCore and a deterministic evaluator."
+description: "Promote a new agent version only after it beats the current one on live traffic, and roll back a regression automatically, with Amazon Bedrock AgentCore and a deterministic evaluator."
 tags: aws, ai, githubactions, devops
 ---
 
-A new version of an AI agent, with a new system prompt, model, or architecture, should reach every user only after it scores at least as well as the current version on real traffic. The hard part is not the deployment. It is deciding, automatically, whether the new version is better, and catching the change that looks harmless in review and still makes the agent worse.
+A new version of an AI agent, with a new system prompt, model, or architecture, should reach every user only after it has shown, on real traffic, that it is better than the current version. I created the [AgentCore A/B Release Gate](https://github.com/alvarog2491/agentcore-ab-release-gate) GitHub Action to automate that decision. It runs an A/B test that compares the new version with the current one on live traffic, and an evaluator score decides whether the new version is promoted or rolled back.
 
-Amazon Bedrock AgentCore provides the building blocks. AgentCore Runtime hosts multiple versions of an agent behind named endpoints, AgentCore Gateway splits traffic between them with an A/B test, and AgentCore Evaluations scores the agent's OpenTelemetry traces with built-in, custom LLM-as-a-judge or code-based evaluators, either continuously (online) or whenever you call the `Evaluate` API (on demand).
+Amazon Bedrock AgentCore provides the building blocks. AgentCore Runtime hosts multiple versions of an agent behind named endpoints, and AgentCore Gateway splits traffic between them with an A/B test. During the test, AgentCore Evaluations scores the sessions of both versions online, with the evaluators you choose for your use case: built-in, custom LLM-as-a-judge or code-based.
 
-In this post, we use the [AgentCore A/B Release Gate](https://github.com/alvarog2491/agentcore-ab-release-gate) GitHub Action to release two versions of a customer-support agent. The action deploys each new container image next to the current version, splits live traffic between them, and promotes the new version only when it passes the quality gates you define. The gate is a deterministic, code-based evaluator that encodes the store's support workflow as rules. The first release is a latency optimization that reads well in a code review, breaks the workflow rules, and is rolled back. The second release fixes a real weakness of the agent and is promoted.
+In this post, we use the [AgentCore A/B Release Gate](https://github.com/alvarog2491/agentcore-ab-release-gate) GitHub Action to release two versions of a customer-support agent. The action deploys each new container image next to the current version, splits live traffic between them, and promotes the new version only when it passes the quality gates you define. The gate is a deterministic, code-based evaluator that encodes the store's support workflow as rules. The first release is a latency optimization that breaks the workflow rules and is rolled back. The second release fixes a weakness of the agent and is promoted.
 
-The showcase is a general-purpose scenario built to show how the action works from start to finish, so that you can apply it in your own work. The customer-support agent, its system prompts and its evaluator are examples. Replace them with your agent, the change you want to release, and the rules that matter in your domain, and the same release flow applies.
+The showcase is a general-purpose scenario that shows how the action works from start to finish. The customer-support agent, its system prompts and its evaluator are examples, and the same release flow applies to other agents, changes and evaluation rules.
 
 All logs and numbers in this post come from real runs.
-
-{% embed https://github.com/alvarog2491/agentcore-release-showcase %}
 
 ## Solution overview
 
 For this post, we use a customer-support assistant for a fictitious online electronics store. Customers ask the assistant which orders they have, where a parcel is, and whether they can return an item. The store has a simple return policy: an item can be returned within 30 days of delivery, final-sale items such as gift cards cannot be returned, and orders that haven't been delivered can't be returned yet.
 
-The store also has a support workflow that every answer must follow: look the facts up instead of guessing them, never invent an order, tracking or return number, never ask the customer for information the agent can look up itself, and check that an item is eligible before opening a return for it. A code-based evaluator scores every turn of the agent against these rules, and the release gate promotes a new version only when it follows them at least as well as the current one.
+The store also has a support workflow that every answer must follow: look the facts up with the tools, never invent an order, tracking or return number, never ask the customer for information the agent can look up itself, and check that an item is eligible before opening a return for it. A code-based evaluator scores every turn of the agent against these rules, and the release gate promotes a new version only when it follows them significantly better than the current one.
 
 ## The agent
 
-The agent serves the store's customers. A customer writes in natural language, for example "Hi, I'm ana@example.com. Where is my keyboard?", and the agent looks up the customer's data, answers with the facts it found, and opens a return when the customer asks for one and the store's policy allows it. It keeps the conversation of each session, so follow-up questions such as "What's the tracking number?" work.
+The agent serves the store's customers. It asks for missing information, looks up the customer's data, answers with the facts it found, and opens a return when the customer asks for one and the store's policy allows it. It keeps the conversation of each session, so follow-up messages build on the earlier turns. The following session with the released agent shows a typical conversation (the tracking table is shown as lines, and the last answer is shortened):
+
+```text
+Customer: Where is my keyboard?
+Agent:    I'm happy to help! Could you please share the email address used for the order,
+          or if you have the order ID handy, that would work too.
+
+Customer: ana@example.com
+Agent:    Here are the tracking details for your keyboard (order ORD‑1002):
+          Carrier: DHL
+          Tracking number: JD014600003456789012
+          Estimated delivery: 2026‑09‑29
+          2026‑09‑25: Shipped from Madrid warehouse
+          2026‑09‑26: Arrived at Lyon sorting facility
+
+Customer: I don't need it anymore. Can I return it?
+Agent:    I'm sorry, but you can only open a return after the item has been delivered. Since
+          the keyboard (SKU KB‑310) is still in transit and expected to arrive on 29 September,
+          the return window hasn't opened yet. ...
+```
 
 The agent uses LangGraph's `create_react_agent` with the `openai.gpt-oss-20b-1:0` model on Amazon Bedrock and runs on AgentCore Runtime inside `BedrockAgentCoreApp`. It receives `{"prompt": "..."}` and answers with `{"result": "..."}`.
 
-The agent has five tools. They read and write a small, fixed dataset in memory (two customers, four orders, their shipments and returns) with a fixed "today" of 2026-09-27, so every run sees the same facts and an invented answer is easy to spot:
+The agent has five tools. They read and write a small, fixed dataset in memory (two customers, four orders, their shipments and returns) with a fixed "today" of 2026-09-27, so every run sees the same facts, and every answer can be checked against them:
 
 | Tool | Input | What it returns |
 |---|---|---|
@@ -119,9 +136,9 @@ Version 2 is a latency optimization on top of version 1. Each tool call is one m
  If you are missing an email, order ID or item, ask the customer for it.
 ```
 
-The change is easy to approve in a code review, and it saves a round trip per return. It also opens returns without telling the customer the conditions first (the deadline, the refund amount, whether the item qualifies at all), which the store's workflow requires, and the shorter prompt makes the agent ask for SKUs even more often.
+The change saves a model round trip per return. It also opens returns without telling the customer the conditions first (the deadline, the refund amount, whether the item qualifies at all), which the store's workflow requires, and the shorter prompt makes the agent ask for SKUs even more often.
 
-Version 3, the one in the repository, fixes the weakness of version 1 instead. It tells the agent where SKUs come from and stops it from asking for them:
+Version 3, the one in the repository, fixes the weakness of version 1. It tells the agent where SKUs come from and stops it from asking for them:
 
 ```diff
  - For "where is my order" questions, use track_shipment.
@@ -133,17 +150,15 @@ Version 3, the one in the repository, fixes the weakness of version 1 instead. I
 +If you are missing an email or order ID, ask the customer for it.
 ```
 
-The prompts of versions 1 and 2 are in the repository's README.
-
 Before releasing anything, we ran each version locally against the same model, with the 12 questions of the traffic script, four times each (48 single-turn sessions per version), and scored every answer with the release gate's rules (described in the next sections). The following table shows the results:
 
-| Version | Scored turns that follow the workflow | Failed requests | Main failure |
-|---|---|---|---|
-| 1 | 42 of 48 (0.88) | 0 | Asks the customer for a SKU (6 turns) |
-| 2 | 29 of 47 (0.62) | 1 | Asks for a SKU (11 turns) or calls `create_return` without `check_return_eligibility` (7 turns) |
-| 3 | 48 of 48 (1.00) | 0 | None |
+| Version | Scored turns that follow the workflow | Main failure |
+|---|---|---|
+| 1 | 42 of 48 (0.88) | Asks the customer for a SKU (6 turns) |
+| 2 | 29 of 47 (0.62) | Asks for a SKU (11 turns) or calls `create_return` without `check_return_eligibility` (7 turns) |
+| 3 | 48 of 48 (1.00) | None |
 
-The failed request is a quirk of `openai.gpt-oss-20b-1:0`, which sometimes returns a tool call with an invalid tool name that the Converse API rejects. In the deployed agent, those requests fail and are not scored, so the gate doesn't see them. The differences in the table are large enough to measure in a 15-minute A/B test with enough traffic, which is what the release gate needs.
+The differences in the table are large enough to measure in a 15-minute A/B test with enough traffic, which is what the release gate needs.
 
 ## Solution components
 
@@ -152,7 +167,7 @@ The solution uses the following components:
 - **AgentCore Runtime** runs the agent container. Each image update creates a new runtime version.
 - **Runtime endpoints** are names that point to one version. The `control` endpoint serves users. The action creates a `treatment` endpoint for the candidate version.
 - **AgentCore Gateway** is the single entry point. It has one HTTP target per endpoint, and the A/B test splits traffic between the targets, per session.
-- **AgentCore Evaluations** reads the agent's OpenTelemetry spans from Amazon CloudWatch. Online evaluation scores every session with a code-based evaluator (an AWS Lambda function) for the release gate. On-demand evaluation scores selected sessions with an LLM-as-a-judge evaluator for the facts that rules can't check.
+- **AgentCore Evaluations** reads the agent's OpenTelemetry spans from Amazon CloudWatch. Online evaluation scores every session with a code-based evaluator (an AWS Lambda function) for the release gate.
 - **GitHub Actions** builds the image, runs the release gate and generates traffic. It deploys through an IAM role assumed with OpenID Connect (OIDC), so there are no AWS keys in the repository.
 
 ## How the release gate works
@@ -164,7 +179,7 @@ The action expects an AgentCore Runtime with a `control` endpoint and a dedicate
 3. **Decide.** For every evaluator in the quality gates, it checks that the treatment mean reaches the threshold, that it is not lower than the control mean, and that the difference is statistically significant (p < 0.05 by default).
 4. **Promote or roll back.** If all gates pass, both endpoints move to the new version. If any gate fails, the job times out, the job is cancelled or AWS returns an error, both endpoints stay on (or return to) the previous version.
 
-You can turn off the significance check when you want to gate on the threshold alone. With the check on, as in this post, a candidate is promoted only when it is measurably better than the current version. A candidate that is as good as the current version, but not better, is rolled back. That is why the version we want to promote, version 3, is a real improvement over version 1, and not a refactoring.
+With `require-significance: false`, the action promotes a candidate that scores equal to or better than the current version and reaches the threshold. With `require-significance: true`, the default and the setting in this post, the improvement must also be statistically significant, so a candidate that only matches the current version is rolled back. That is why version 3, the one we want to promote, has to improve on version 1.
 
 ## The release gate evaluator
 
@@ -272,13 +287,6 @@ def handler(event, context=None):
 
 AgentCore calls the function with the spans of the session in `evaluationInput.sessionSpans` and the trace to score in `evaluationTarget.traceIds`. The function returns `label` and `value`, plus an optional `explanation`, or `errorCode` and `errorMessage` when there is nothing to score. A failed turn's explanation names the rule it broke, for example `create_return was called for ORD-1001 HD-200 without check_return_eligibility first.`
 
-Two details matter when you write rules on model output:
-
-- **Normalize the text.** The model often writes `ORD‑1001` with a non-breaking hyphen (U+2011) instead of `-`, so the evaluator normalizes hyphens before it matches identifiers.
-- **Allow the agent to repeat what the customer said.** Asking "Could you share the email for order ORD-1004?" repeats the customer's order ID. It is not a fact the agent looked up, so the "look it up" rule ignores identifiers from customer messages.
-
-We tested the evaluator in two ways before deploying it. Unit tests in `src/evaluators/test_support_workflow.py` cover each rule and the span parsing (`python -m unittest discover src/evaluators`). Then we passed the spans of real sessions, downloaded from CloudWatch, to the handler, and ran the prompt comparison shown earlier, which uses the same `check_turn` function.
-
 The following Terraform registers the evaluator and the online evaluation configuration that the action uses as a template (from `infra/evaluations.tf`):
 
 ```hcl
@@ -299,7 +307,7 @@ resource "aws_bedrockagentcore_evaluator" "support_workflow" {
   depends_on = [aws_lambda_permission.agentcore_evaluations]
 }
 
-# --- Online evaluation config (release gate template) ---
+# --- Online evaluation config ---
 
 # Runtime log groups are created by AgentCore on the first invocation.
 # Pre-create the control one so the evaluation config can point at it
@@ -309,9 +317,8 @@ resource "aws_cloudwatch_log_group" "control_runtime" {
   retention_in_days = 30
 }
 
-# Template for the release gate (action input evaluation-config-id). The gate
-# copies it per variant, replacing the control endpoint name with "treatment"
-# in the service and log group names below, so both must contain it.
+# Online evaluation of the control endpoint: scores every session of the agent
+# with the support-workflow evaluator.
 resource "aws_bedrockagentcore_online_evaluation_config" "control" {
   online_evaluation_config_name = "${var.agent_name}_${var.control_endpoint_name}_eval"
   description                   = "Evaluation of the control endpoint; template for A/B releases"
@@ -325,8 +332,6 @@ resource "aws_bedrockagentcore_online_evaluation_config" "control" {
     }
   }
 
-  # Every evaluator in the workflow's quality-gates must be here. Each extra
-  # evaluator scores every session of both variants, so keep only the gate.
   evaluator {
     evaluator_id = aws_bedrockagentcore_evaluator.support_workflow.evaluator_id
   }
@@ -344,7 +349,7 @@ resource "aws_bedrockagentcore_online_evaluation_config" "control" {
   lifecycle {
     precondition {
       condition     = !strcontains(var.agent_name, var.control_endpoint_name)
-      error_message = "agent_name must not contain control_endpoint_name: the release gate replaces it with \"treatment\" in the service and log group names."
+      error_message = "agent_name must not contain control_endpoint_name."
     }
   }
 
@@ -354,25 +359,17 @@ resource "aws_bedrockagentcore_online_evaluation_config" "control" {
 
 With our values, the log group is `/aws/bedrock-agentcore/runtimes/<runtime-id>-control` and the service name is `showcase_agent.control`. The configuration scores 100% of the sessions and treats a session as complete after 2 idle minutes.
 
-For every release, the action makes one copy of this configuration per variant by replacing `control` with `treatment` in the log group and the service name. Both must contain `control`, and the agent name must not.
+For every release, the action makes one copy of this configuration per variant by replacing `control` with `treatment` in the log group and the service name.
 
 AgentCore creates the runtime's log group on the first invocation, so Terraform creates it up front. That way, the configuration can point to it from the beginning.
 
-The template contains only the gate evaluator. Every evaluator in the configuration scores every session of both variants during a release, so an LLM-as-a-judge evaluator there adds judge-model cost to each session. AgentCore also locks an evaluator that an enabled online configuration references, so you must disable the configuration before you change the evaluator's definition. Changing only the Lambda code is fine.
+The template contains only the gate evaluator. Every evaluator in the configuration scores every session of both variants during a release, so an LLM-as-a-judge evaluator there adds judge-model cost to each session. AgentCore also locks an evaluator that an enabled online configuration references, so changing the evaluator's definition requires disabling the configuration first. Changes to the Lambda code apply directly.
 
-## Prerequisites
+## The environment
 
-Before you deploy this solution, set up your environment with the following:
+The showcase runs in `eu-central-1`, in an AWS account with AgentCore Runtime, Gateway, Evaluations and A/B testing. The agent uses `openai.gpt-oss-20b-1:0` on Amazon Bedrock. CloudWatch Transaction Search is enabled, because AgentCore Evaluations reads the agent's spans from it. GitHub Actions deploys through the account's GitHub OIDC identity provider, and the image builds on an `ubuntu-24.04-arm` runner. The infrastructure is defined with Terraform v1.14 and the AWS provider v6.63.
 
-- An AWS account and a Region with AgentCore Runtime, Gateway, Evaluations and A/B testing. We use `eu-central-1`.
-- Access in Amazon Bedrock to `openai.gpt-oss-20b-1:0` for the agent and to `openai.gpt-oss-120b-1:0` for the on-demand judge.
-- CloudWatch Transaction Search enabled, because AgentCore Evaluations reads the spans from it. `aws xray get-trace-segment-destination` should return `CloudWatchLogs` and `ACTIVE`.
-- The GitHub OIDC identity provider in IAM (`token.actions.githubusercontent.com`).
-- Terraform v1.14 or later with the AWS provider v6.63 or later.
-- Docker with buildx, the AWS Command Line Interface (AWS CLI), the GitHub CLI and [uv](https://docs.astral.sh/uv/) with Python v3.12 or later.
-- A GitHub repository. The build runs on `ubuntu-24.04-arm`, which is free for public repositories.
-
-On the AWS side, the action expects an ARM64 image in Amazon Elastic Container Registry (Amazon ECR), a runtime with a ready `control` endpoint, a dedicated HTTP gateway, one enabled online evaluation configuration, an A/B test role and a deploy role. The Terraform in the repository creates all of them, plus the on-demand judge.
+The action works with an ARM64 image in Amazon Elastic Container Registry (Amazon ECR), a runtime with a `control` endpoint, a dedicated HTTP gateway, an enabled online evaluation configuration, an A/B test role and a deploy role. The Terraform in the repository creates all of them.
 
 ## The infrastructure
 
@@ -384,7 +381,6 @@ The `infra/` folder contains one file per concern:
 | `runtime.tf` | The runtime and the `control` endpoint |
 | `gateway.tf` | The HTTP gateway and its `control` target |
 | `evaluations.tf` | The evaluator Lambda function, the evaluator and the online evaluation configuration |
-| `evaluators.tf` | The LLM-as-a-judge evaluator for on-demand evaluation |
 | `iam.tf` | Roles for the runtime, the gateway and the evaluations |
 | `release.tf` | The A/B test role and the GitHub deploy role |
 
@@ -474,13 +470,9 @@ AgentCore assumes the A/B test role to manage the gateway rules and to read the 
 
 GitHub Actions assumes the deploy role. It has the permissions listed in the action's README, plus ECR push for the build and `bedrock-agentcore:InvokeGateway` for the traffic job. Its `max_session_duration` is 4 hours, because the action uses the credentials for the whole test.
 
-## Deploy the solution
+## How the showcase is deployed
 
-The infrastructure is deployed by hand with Terraform. Only agent releases run in GitHub Actions.
-
-The runtime needs an image when it is created, so the ECR repository comes first. Build the bootstrap image from version 1 of the prompt (in the repository's README), not from the repository's version 3. Complete the following steps:
-
-1. Create the ECR repository, push version 1 of the agent with the tag `bootstrap`, and create the rest of the infrastructure:
+For this showcase, the infrastructure is deployed by hand with Terraform, and only agent releases run in GitHub Actions. The runtime needs an image when it is created, so Terraform creates the ECR repository first, a first image is pushed to it with the tag `bootstrap`, and Terraform then creates the rest of the infrastructure:
 
 ```bash
 terraform -chdir=infra init
@@ -490,7 +482,7 @@ REPO=$(terraform -chdir=infra output -raw ecr_repository_url)
 aws ecr get-login-password --region eu-central-1 \
   | docker login --username AWS --password-stdin "${REPO%%/*}"
 
-# Version 1 with the tag "bootstrap". ARM64, built from the repository root.
+# First image with the tag "bootstrap". ARM64, built from the repository root.
 docker buildx build --platform linux/arm64 --provenance=false \
   -f src/agent/Dockerfile -t "$REPO:bootstrap" --push .
 
@@ -511,7 +503,7 @@ runtime_id                    = "showcase_agent-5d8CQj7PYA"
 support_workflow_evaluator_id = "showcase_agent_support_workflow-6D9E4mCaGA"
 ```
 
-2. Generate traffic against version 1. `scripts/traffic.sh` sends customer questions to the gateway, one new session per request, signed with SigV4. Each request is the following `curl` call, where `$url` is `https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/control/invocations`:
+`scripts/traffic.sh` plays the customers. It sends customer questions to the gateway, one new session per request, signed with SigV4. Each request is the following `curl` call, where `$url` is `https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/control/invocations`:
 
 ```bash
 status=$(curl -sS -o /tmp/traffic-response.json -w '%{http_code}' --max-time 120 \
@@ -536,21 +528,19 @@ Worker 1 sent 4 requests, 0 failed.
 Worker 0 sent 5 requests, 0 failed.
 ```
 
-Version 1 reads the data: the DHL tracking number, the return window of the monitor and the RMA number all come from the tools. The first answer also shows why the release gate needs more than rules on identifiers: the return deadline of the headphones is 2026-10-14, not 10 October. That kind of error is what the on-demand judge at the end of this post is for.
+Version 1 reads the data: the DHL tracking number, the return window of the monitor and the RMA number all come from the tools.
+The online evaluation configuration scores every session of the `control` endpoint, so version 1 has a baseline score before the first release. The control columns of the two releases below show its scores.
 
-3. Wait a few minutes for online evaluation to score the sessions. Every session is scored by the template configuration, so you can check the baseline before the first release. Version 1 follows the workflow in most turns and fails the return requests where it asks for a SKU; the control column of the first release below shows its scores on 191 turns.
-
-## Configure the release workflow
+## The release workflow
 
 `.github/workflows/release.yml` runs on every push to `main` that changes the agent. It has three jobs:
 
 - `publish` builds the ARM64 image on an ARM runner and pushes it to Amazon ECR with the commit SHA as the tag (about 1 minute).
 - `deploy` runs the release gate (about 20 minutes).
-- `traffic` runs in parallel with `deploy` and plays the customers (about 25 minutes). The action only observes traffic; in production, your users generate it.
+- `traffic` runs in parallel with `deploy` and plays the customers (about 25 minutes). The action only observes traffic; in production, real users generate it.
 
 The following step calls the action:
 
-{% raw %}
 ```yaml
 - uses: alvarog2491/agentcore-ab-release-gate@c3b197619c73e45d395bb3eb9a535ddc464ed254 # v1.1.2
   with:
@@ -566,6 +556,9 @@ The following step calls the action:
     duration-seconds: ${{ env.OBSERVATION_SECONDS }}
     control-weight: '50'
     treatment-weight: '50'
+    # Scores arrive in batches minutes after a session ends; wait for the
+    # sample count to stay stable for 5 min so most sessions are counted.
+    scoring-lag-seconds: '300'
     # Minimum treatment score per evaluator ID (`terraform output support_workflow_evaluator_id`).
     # support_workflow scores each turn 1 if it follows the store's support
     # workflow (looks facts up, invents no IDs, never asks for a SKU, checks
@@ -573,7 +566,6 @@ The following step calls the action:
     quality-gates: >-
       {"showcase_agent_support_workflow-6D9E4mCaGA": 0.9}
 ```
-{% endraw %}
 
 `step: auto` observes and promotes in the same job. We changed the following inputs from their defaults:
 
@@ -584,12 +576,11 @@ The following step calls the action:
 
 The remaining inputs keep their defaults. `require-significance` is `true`, so the p-value must be below 0.05, and `evaluation-timeout-seconds` is 1800.
 
-The keys of `quality-gates` are full evaluator IDs, including the random suffix that AWS adds to custom evaluators. Copy the ID from `terraform output support_workflow_evaluator_id` after each apply.
+The keys of `quality-gates` are full evaluator IDs, including the random suffix that AWS adds to custom evaluators. The workflow holds the ID from `terraform output support_workflow_evaluator_id`.
 
-The traffic job runs four parallel customers that send the same 12 questions in a loop, one new session per question, so each variant collects enough sessions for a significant result in 15 minutes. Seven of the questions are return requests or return questions, because most of the workflow rules apply to returns. In production, your users generate the traffic, and the mix is whatever they ask.
+The traffic job runs four parallel customers that send the same 12 questions in a loop, one new session per question, so each variant collects enough sessions for a significant result in 15 minutes. Seven of the questions are return requests or return questions, because most of the workflow rules apply to returns. In production, the traffic comes from real users.
 
 {% details The full release.yml %}
-{% raw %}
 ```yaml
 name: Release agent
 
@@ -721,14 +712,22 @@ jobs:
       # parallel customers give each variant enough sessions for significance.
       - run: scripts/traffic.sh "${{ vars.AGENTCORE_GATEWAY_ID }}" "$AWS_REGION" $((OBSERVATION_SECONDS + 600)) 5 4
 ```
-{% endraw %}
 {% enddetails %}
+
+## Agent and runtime versions
+
+AgentCore numbers each deployed image as a runtime version, and the logs in the next sections use those numbers. In this account they run one ahead of the agent versions, because the runtime was created with an earlier `bootstrap` image:
+
+| Agent version | Prompt | Runtime version |
+|---|---|---|
+| — | `bootstrap` image, unused in this post | 1 |
+| 1 | Baseline | 2 |
+| 2 | Latency edit | 3 |
+| 3 | SKU fix | 4 |
 
 ## Release version 2: rolled back
 
-With version 2 in `DEFAULT_SYSTEM_PROMPT`, a push to `main` starts the release. The control serves version 1.
-
-The runtime numbers its versions on every image update, and they don't match the agent versions of this post. In our account, runtime version 1 was an earlier bootstrap image, version 1 of the agent ran as runtime version 2, and the release created runtime version 3 for agent version 2.
+With agent version 2 in `DEFAULT_SYSTEM_PROMPT`, a push to `main` starts the release. The control serves agent version 1.
 
 The following table shows how the run progressed (times in UTC):
 
@@ -737,14 +736,14 @@ The following table shows how the run progressed (times in UTC):
 | 08:30:29 | `publish` starts. Build and push take 81 seconds |
 | 08:32:03 | The action resolves the image digest |
 | 08:32:05 | The `treatment` endpoint and gateway target from an earlier release are reused |
-| 08:32:06 | New image deployed as runtime version 3 |
-| 08:32:27 | `treatment` moves to runtime version 3, `control` stays on runtime version 2 |
+| 08:32:06 | Agent version 2 deployed |
+| 08:32:27 | `treatment` serves agent version 2, `control` stays on agent version 1 |
 | 08:32:50 | One evaluation configuration per variant is ready |
 | 08:33:02 | The A/B test is running, 50/50 |
 | 08:48:02 | End of the 900 seconds of observation |
 | 08:49:02 | First results: 27 treatment and 18 control sessions scored |
 | 09:18:02 | Final results: 208 treatment and 172 control sessions; the gate fails |
-| 09:18:55 | Candidate rolled back |
+| 09:18:55 | Candidate rolled back: both endpoints serve agent version 1 |
 
 The following are the main lines of the action's log:
 
@@ -896,7 +895,7 @@ endpoints: [('treatment', '3', None, 'READY'), ('control', '2', None, 'READY'), 
 targets: ['control', 'treatment']
 ```
 
-`DEFAULT` always follows the latest runtime version, so it was already on the candidate. Route users through the gateway.
+`DEFAULT` always follows the latest deployed image, so it was already on the candidate. Users reach the agent through the gateway, which routes them to `control` or `treatment`.
 
 The following JSON shows the A/B test created by the action, from `GetABTest` (shortened):
 
@@ -918,8 +917,7 @@ The following JSON shows the A/B test created by the action, from `GetABTest` (s
 }
 ```
 
-Clients keep calling `/control/invocations`, and the gateway decides for each session which target answers. The traffic job sent 601 requests in 25 minutes. 15 of them failed: 11 with HTTP 424 (the runtime returned a 500 when the model produced an invalid tool name) and 4 with a client timeout.
-
+Clients keep calling `/control/invocations`, and the gateway decides for each session which target answers. The traffic job sent 601 requests in 25 minutes.
 The following answers to "Please open a return for the USB-C cable in ORD-1001, it doesn't charge my phone." come from the runtime logs of each endpoint (shortened). The control checked eligibility and opened the return. The treatment opened it directly in some sessions and asked the customer for the SKU in others:
 
 ```text
@@ -934,7 +932,7 @@ treatment: I'm sorry, but the "USB-C cable" isn't listed in order ORD‑1001. Co
 
 The last answer is wrong as well as unhelpful: the cable is in the order, and the treatment never read it.
 
-## Interpreting the release results
+## Interpreting the rollback results
 
 Every turn is scored on its own. The following are two result records, one from each variant (shortened):
 
@@ -980,8 +978,6 @@ The following table counts the scored turns by rule, from the evaluation result 
 | `create_return` without `check_return_eligibility` | 0 | 32 |
 | Invented identifier | 1 | 0 |
 
-The evaluation results also contain 202 turns without a score. In 197 of them, AgentCore Evaluations couldn't invoke the evaluator Lambda function (`ThrottlingException: Rate Exceeded`), and in 5 the trace had no agent turn. The account's Lambda concurrency quota was the default of 10 for new accounts, and online evaluation invokes the function for a whole batch of sessions at once. Throttled turns are not retried and not counted, so they reduce the sample size but don't bias the result.
-
 The following result is the one the action used for its decision:
 
 ```json
@@ -1001,9 +997,9 @@ The following result is the one the action used for its decision:
 }]
 ```
 
-Treatment scored 0.649, below the threshold of 0.9, and 0.275 lower than the control's 0.924. The difference is significant (p-value 6.3e-9), so the result isn't noise: version 2 is worse. Two gate conditions failed, the minimum score and the no-regression check, and the action rolled the candidate back. The numbers match the local comparison (0.88 and 0.62) closely.
+Treatment scored 0.649, below the threshold of 0.9, and 0.275 lower than the control's 0.924. With a p-value of 6.3e-9, version 2 is significantly worse. Two gate conditions failed, the minimum score and the no-regression check, and the action rolled the candidate back. The numbers match the local comparison (0.88 and 0.62) closely.
 
-The action stopped the A/B test, moved `treatment` back to the control's runtime version, and deleted the temporary evaluation configurations. Users stayed on version 1, except for the sessions that the A/B test routed to the treatment while it ran.
+The action stopped the A/B test, moved `treatment` back to agent version 1, and deleted the temporary evaluation configurations. Users stayed on version 1, except for the sessions that the A/B test routed to the treatment while it ran.
 
 ```text
 endpoints: [('treatment', '2', None, 'READY'), ('control', '2', None, 'READY'), ('DEFAULT', '3', None, 'READY')]
@@ -1013,141 +1009,243 @@ eval configs left: ['showcase_agent_control_eval-TIuENTGKTP']
 
 The release workflow fails when the gate fails, so the commit that introduced version 2 shows a failed check on GitHub. The A/B test stays in AgentCore for later inspection.
 
-The decision came at 09:18:02, exactly 30 minutes after the observation ended, which is the default `evaluation-timeout-seconds`. Online evaluation scored new sessions in batches about every 5 minutes, so the sample count never stayed unchanged for the full 300 seconds of `scoring-lag-seconds`. When the timeout expires and every evaluator has results, the action decides on the latest results instead of failing, so the decision used all 380 scored sessions.
+The decision came at 09:18:02, exactly 30 minutes after the observation ended, which is the default `evaluation-timeout-seconds`. Online evaluation scored new sessions in batches about every 5 minutes, so the sample count never stayed unchanged for the full 300 seconds of `scoring-lag-seconds`. When the timeout expires and every evaluator has results, the action decides on the latest results, so the decision used all 380 scored sessions.
 
 ## Release version 3: promoted
 
-Version 3 replaces version 2 in the repository, so the next push undoes the latency change and adds the SKU fix in one release. The control still serves version 1.
+Agent version 3 replaces agent version 2 in the repository, so the next push undoes the latency change and adds the SKU fix in one release. The control still serves agent version 1.
 
-<!-- TODO: fill from the release run of version 3. -->
+The following table shows how the run progressed (times in UTC):
 
 | Time | Event |
 |---|---|
-| TODO | `publish` starts |
-| TODO | The A/B test is running, 50/50 |
-| TODO | End of the 900 seconds of observation |
-| TODO | Results stable, quality gate passed |
-| TODO | Version 3 promoted |
+| 09:25:53 | `publish` starts. Build and push take 39 seconds |
+| 09:26:49 | The action resolves the image digest |
+| 09:26:53 | Agent version 3 deployed |
+| 09:27:14 | `treatment` serves agent version 3, `control` stays on agent version 1 |
+| 09:27:16 | One evaluation configuration per variant is ready |
+| 09:27:28 | The A/B test is running, 50/50 |
+| 09:42:29 | End of the 900 seconds of observation |
+| 09:43:29 | First results: 31 treatment and 30 control sessions scored |
+| 09:48:31 | The difference is significant for the first time (p-value 0.036, 156 sessions) |
+| 10:12:29 | Final results: 226 treatment and 221 control sessions; the gate passes |
+| 10:13:21 | Agent version 3 promoted: both endpoints serve it |
 
 The following are the main lines of the action's log:
 
 ```text
-TODO
+09:26:49 {"event": "candidate-image-resolved", "image": "123456789012.dkr.ecr.eu-central-1.amazonaws.com/agentcore-release-showcase@sha256:a1c51c7068f1ef198f389d631e268c41d98e1e0f43e52d1b3d5996f3e13967f5", "observationSeconds": 900}
+09:26:52 {"event": "deployment-prepared", "baseline": "2", "runtime": "showcase_agent-5d8CQj7PYA", "gateway": "agentcore-release-showcase-gateway-tbxw0u5whz"}
+09:26:53 {"event": "candidate-runtime-created", "version": "4"}
+09:27:14 {"event": "treatment-endpoint-serving", "endpoint": "treatment", "version": "4"}
+09:27:15 {"event": "evaluation-config-created", "variant": "control", "evaluationConfigId": "showcase_agent_control_eval_c_25f9fc3d-KfWn449e4c"}
+09:27:16 {"event": "evaluation-config-created", "variant": "treatment", "evaluationConfigId": "showcase_agent_control_eval_t_445b86de-OTKWod9g50"}
+09:27:18 {"event": "ab-test-created", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7"}
+09:27:28 {"event": "ab-test-running", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7"}
+09:42:29 {"event": "evaluation-results-waiting", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7"}
+09:43:29 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 60, "remainingSeconds": 1739, "totalSamplesScored": 31, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+…  (a 'stabilizing-results' line every 30 s while scores arrive)
+10:12:29 {"event": "ab-test-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "results": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "isSignificant": true, "absoluteChange": 0.08597285067873306, "percentChange": 9.405940594059409, "pValue": 0.004651189571069745, "treatmentSampleSize": 226, "controlSampleSize": 221}}}
+10:12:29 {"event": "quality-gates-passed", "evaluators": ["showcase_agent_support_workflow-6D9E4mCaGA"]}
+10:12:29 {"event": "candidate-promotion-starting", "version": "4"}
+10:13:21 {"event": "candidate-promoted", "version": "4"}
 ```
 
+{% details The full log of the action (120 events) %}
+```text
+09:26:49 {"event": "candidate-image-resolved", "image": "123456789012.dkr.ecr.eu-central-1.amazonaws.com/agentcore-release-showcase@sha256:a1c51c7068f1ef198f389d631e268c41d98e1e0f43e52d1b3d5996f3e13967f5", "observationSeconds": 900}
+09:26:49 {"event": "deployment-preparing", "controlEndpoint": "control"}
+09:26:51 {"event": "treatment-endpoint-existing", "endpoint": "treatment"}
+09:26:51 {"event": "treatment-endpoint-ready", "endpoint": "treatment"}
+09:26:51 {"event": "gateway-target-existing", "target": "control"}
+09:26:52 {"event": "gateway-target-ready", "target": "control", "targetId": "1FXXBFSC0Y"}
+09:26:52 {"event": "gateway-target-existing", "target": "treatment"}
+09:26:52 {"event": "gateway-target-ready", "target": "treatment", "targetId": "RULIRM0A1H"}
+09:26:52 {"event": "deployment-prepared", "baseline": "2", "runtime": "showcase_agent-5d8CQj7PYA", "gateway": "agentcore-release-showcase-gateway-tbxw0u5whz"}
+09:26:52 {"event": "candidate-runtime-creating", "image": "123456789012.dkr.ecr.eu-central-1.amazonaws.com/agentcore-release-showcase@sha256:a1c51c7068f1ef198f389d631e268c41d98e1e0f43e52d1b3d5996f3e13967f5"}
+09:26:53 {"event": "candidate-runtime-created", "version": "4"}
+09:27:03 {"event": "candidate-runtime-ready", "version": "4"}
+09:27:03 {"event": "treatment-endpoint-updating", "endpoint": "treatment", "version": "4"}
+09:27:14 {"event": "treatment-endpoint-serving", "endpoint": "treatment", "version": "4"}
+09:27:14 {"event": "evaluation-config-template-loading", "evaluationConfigId": "showcase_agent_control_eval-TIuENTGKTP"}
+09:27:14 {"event": "evaluation-config-creating", "variant": "control"}
+09:27:15 {"event": "evaluation-config-created", "variant": "control", "evaluationConfigId": "showcase_agent_control_eval_c_25f9fc3d-KfWn449e4c"}
+09:27:15 {"event": "evaluation-config-ready", "variant": "control", "evaluationConfigId": "showcase_agent_control_eval_c_25f9fc3d-KfWn449e4c"}
+09:27:15 {"event": "evaluation-config-creating", "variant": "treatment"}
+09:27:16 {"event": "evaluation-config-created", "variant": "treatment", "evaluationConfigId": "showcase_agent_control_eval_t_445b86de-OTKWod9g50"}
+09:27:16 {"event": "evaluation-config-ready", "variant": "treatment", "evaluationConfigId": "showcase_agent_control_eval_t_445b86de-OTKWod9g50"}
+09:27:16 {"event": "ab-test-creating", "controlWeight": 50, "treatmentWeight": 50, "gatewayArn": "arn:aws:bedrock-agentcore:eu-central-1:123456789012:gateway/agentcore-release-showcase-gateway-tbxw0u5whz"}
+09:27:18 {"event": "ab-test-created", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7"}
+09:27:28 {"event": "ab-test-running", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7"}
+09:27:28 {"event": "listening-for-connections", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "observationSeconds": 900, "message": "A/B test is running; waiting for Gateway connections and evaluator results."}
+09:27:59 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 30, "remainingSeconds": 870, "abTestStatus": "RUNNING"}
+09:28:29 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 60, "remainingSeconds": 840, "abTestStatus": "RUNNING"}
+09:28:59 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 90, "remainingSeconds": 810, "abTestStatus": "RUNNING"}
+09:29:29 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 120, "remainingSeconds": 780, "abTestStatus": "RUNNING"}
+09:29:59 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 150, "remainingSeconds": 750, "abTestStatus": "RUNNING"}
+09:30:30 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 181, "remainingSeconds": 719, "abTestStatus": "RUNNING"}
+09:31:00 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 211, "remainingSeconds": 689, "abTestStatus": "RUNNING"}
+09:31:30 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 241, "remainingSeconds": 659, "abTestStatus": "RUNNING"}
+09:32:00 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 271, "remainingSeconds": 629, "abTestStatus": "RUNNING"}
+09:32:31 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 302, "remainingSeconds": 598, "abTestStatus": "RUNNING"}
+09:33:01 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 332, "remainingSeconds": 568, "abTestStatus": "RUNNING"}
+09:33:31 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 362, "remainingSeconds": 538, "abTestStatus": "RUNNING"}
+09:34:01 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 392, "remainingSeconds": 508, "abTestStatus": "RUNNING"}
+09:34:32 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 422, "remainingSeconds": 478, "abTestStatus": "RUNNING"}
+09:35:02 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 453, "remainingSeconds": 447, "abTestStatus": "RUNNING"}
+09:35:32 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 483, "remainingSeconds": 417, "abTestStatus": "RUNNING"}
+09:36:02 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 513, "remainingSeconds": 387, "abTestStatus": "RUNNING"}
+09:36:32 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 543, "remainingSeconds": 357, "abTestStatus": "RUNNING"}
+09:37:03 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 574, "remainingSeconds": 326, "abTestStatus": "RUNNING"}
+09:37:33 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 604, "remainingSeconds": 296, "abTestStatus": "RUNNING"}
+09:38:03 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 634, "remainingSeconds": 266, "abTestStatus": "RUNNING"}
+09:38:34 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 664, "remainingSeconds": 236, "abTestStatus": "RUNNING"}
+09:39:04 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 695, "remainingSeconds": 205, "abTestStatus": "RUNNING"}
+09:39:34 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 725, "remainingSeconds": 175, "abTestStatus": "RUNNING"}
+09:40:04 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 755, "remainingSeconds": 145, "abTestStatus": "RUNNING"}
+09:40:34 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 785, "remainingSeconds": 115, "abTestStatus": "RUNNING"}
+09:41:05 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 815, "remainingSeconds": 85, "abTestStatus": "RUNNING"}
+09:41:35 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 846, "remainingSeconds": 54, "abTestStatus": "RUNNING"}
+09:42:05 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 876, "remainingSeconds": 24, "abTestStatus": "RUNNING"}
+09:42:29 {"event": "observing", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 900, "remainingSeconds": 0, "abTestStatus": "RUNNING"}
+09:42:29 {"event": "evaluation-results-waiting", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7"}
+09:42:29 {"event": "waiting-for-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 0, "remainingSeconds": 1799, "totalSamplesScored": 0, "evaluatorsReady": [], "evaluatorsWaiting": ["showcase_agent_support_workflow-6D9E4mCaGA"], "partialResults": {}}
+09:42:59 {"event": "waiting-for-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 30, "remainingSeconds": 1769, "totalSamplesScored": 0, "evaluatorsReady": [], "evaluatorsWaiting": ["showcase_agent_support_workflow-6D9E4mCaGA"], "partialResults": {}}
+09:43:29 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 60, "remainingSeconds": 1739, "totalSamplesScored": 31, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:43:59 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 90, "remainingSeconds": 1709, "totalSamplesScored": 31, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:44:29 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 120, "remainingSeconds": 1679, "totalSamplesScored": 31, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:45:00 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 151, "remainingSeconds": 1648, "totalSamplesScored": 31, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:45:30 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 181, "remainingSeconds": 1618, "totalSamplesScored": 31, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:46:00 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 211, "remainingSeconds": 1588, "totalSamplesScored": 31, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:46:30 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 241, "remainingSeconds": 1558, "totalSamplesScored": 31, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:47:00 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 271, "remainingSeconds": 1528, "totalSamplesScored": 31, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:47:31 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 302, "remainingSeconds": 1497, "totalSamplesScored": 31, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:48:01 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 332, "remainingSeconds": 1467, "totalSamplesScored": 31, "stableForSeconds": 271, "remainingScoringLagSeconds": 28, "awaitingSignificance": true, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 31, "controlSamples": 30, "pValue": 0.22384901956790412}}}
+09:48:31 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 362, "remainingSeconds": 1437, "totalSamplesScored": 77, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:49:01 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 392, "remainingSeconds": 1407, "totalSamplesScored": 77, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:49:31 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 422, "remainingSeconds": 1377, "totalSamplesScored": 77, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:50:02 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 452, "remainingSeconds": 1347, "totalSamplesScored": 77, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:50:32 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 483, "remainingSeconds": 1316, "totalSamplesScored": 77, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:51:02 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 513, "remainingSeconds": 1286, "totalSamplesScored": 77, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:51:32 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 543, "remainingSeconds": 1256, "totalSamplesScored": 77, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:52:02 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 573, "remainingSeconds": 1226, "totalSamplesScored": 77, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:52:33 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 604, "remainingSeconds": 1195, "totalSamplesScored": 77, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:53:03 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 634, "remainingSeconds": 1165, "totalSamplesScored": 77, "stableForSeconds": 272, "remainingScoringLagSeconds": 27, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 77, "controlSamples": 79, "pValue": 0.03551590204789858}}}
+09:53:33 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 664, "remainingSeconds": 1135, "totalSamplesScored": 121, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:54:03 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 694, "remainingSeconds": 1105, "totalSamplesScored": 121, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:54:34 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 725, "remainingSeconds": 1074, "totalSamplesScored": 121, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:55:04 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 755, "remainingSeconds": 1044, "totalSamplesScored": 121, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:55:34 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 785, "remainingSeconds": 1014, "totalSamplesScored": 121, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:56:04 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 815, "remainingSeconds": 984, "totalSamplesScored": 121, "stableForSeconds": 151, "remainingScoringLagSeconds": 148, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:56:35 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 846, "remainingSeconds": 953, "totalSamplesScored": 121, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:57:05 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 876, "remainingSeconds": 923, "totalSamplesScored": 121, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:57:35 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 906, "remainingSeconds": 893, "totalSamplesScored": 121, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:58:05 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 936, "remainingSeconds": 863, "totalSamplesScored": 121, "stableForSeconds": 271, "remainingScoringLagSeconds": 28, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 121, "controlSamples": 127, "pValue": 0.008705965291881924}}}
+09:58:35 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 966, "remainingSeconds": 833, "totalSamplesScored": 165, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+09:59:06 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 997, "remainingSeconds": 802, "totalSamplesScored": 165, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+09:59:36 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1027, "remainingSeconds": 772, "totalSamplesScored": 165, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+10:00:06 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1057, "remainingSeconds": 742, "totalSamplesScored": 165, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+10:00:36 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1087, "remainingSeconds": 712, "totalSamplesScored": 165, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+10:01:06 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1117, "remainingSeconds": 682, "totalSamplesScored": 165, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+10:01:36 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1147, "remainingSeconds": 652, "totalSamplesScored": 165, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+10:02:07 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1178, "remainingSeconds": 621, "totalSamplesScored": 165, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+10:02:37 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1208, "remainingSeconds": 591, "totalSamplesScored": 165, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+10:03:07 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1238, "remainingSeconds": 561, "totalSamplesScored": 165, "stableForSeconds": 271, "remainingScoringLagSeconds": 28, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 165, "controlSamples": 174, "pValue": 0.006832239542905676}}}
+10:03:37 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1268, "remainingSeconds": 531, "totalSamplesScored": 211, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:04:08 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1299, "remainingSeconds": 500, "totalSamplesScored": 211, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:04:38 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1329, "remainingSeconds": 470, "totalSamplesScored": 211, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:05:08 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1359, "remainingSeconds": 440, "totalSamplesScored": 211, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:05:38 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1389, "remainingSeconds": 410, "totalSamplesScored": 211, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:06:08 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1419, "remainingSeconds": 380, "totalSamplesScored": 211, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:06:39 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1449, "remainingSeconds": 350, "totalSamplesScored": 211, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:07:09 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1480, "remainingSeconds": 319, "totalSamplesScored": 211, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:07:39 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1510, "remainingSeconds": 289, "totalSamplesScored": 211, "stableForSeconds": 241, "remainingScoringLagSeconds": 58, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:08:09 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1540, "remainingSeconds": 259, "totalSamplesScored": 211, "stableForSeconds": 271, "remainingScoringLagSeconds": 28, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 211, "controlSamples": 212, "pValue": 0.006188426951929415}}}
+10:08:39 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1570, "remainingSeconds": 229, "totalSamplesScored": 226, "stableForSeconds": 0, "remainingScoringLagSeconds": 300, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 226, "controlSamples": 221, "pValue": 0.004651189571069745}}}
+10:09:10 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1601, "remainingSeconds": 198, "totalSamplesScored": 226, "stableForSeconds": 30, "remainingScoringLagSeconds": 269, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 226, "controlSamples": 221, "pValue": 0.004651189571069745}}}
+10:09:40 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1631, "remainingSeconds": 168, "totalSamplesScored": 226, "stableForSeconds": 60, "remainingScoringLagSeconds": 239, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 226, "controlSamples": 221, "pValue": 0.004651189571069745}}}
+10:10:10 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1661, "remainingSeconds": 138, "totalSamplesScored": 226, "stableForSeconds": 90, "remainingScoringLagSeconds": 209, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 226, "controlSamples": 221, "pValue": 0.004651189571069745}}}
+10:10:40 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1691, "remainingSeconds": 108, "totalSamplesScored": 226, "stableForSeconds": 120, "remainingScoringLagSeconds": 179, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 226, "controlSamples": 221, "pValue": 0.004651189571069745}}}
+10:11:10 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1721, "remainingSeconds": 78, "totalSamplesScored": 226, "stableForSeconds": 150, "remainingScoringLagSeconds": 149, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 226, "controlSamples": 221, "pValue": 0.004651189571069745}}}
+10:11:41 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1752, "remainingSeconds": 47, "totalSamplesScored": 226, "stableForSeconds": 181, "remainingScoringLagSeconds": 118, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 226, "controlSamples": 221, "pValue": 0.004651189571069745}}}
+10:12:11 {"event": "stabilizing-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "elapsedSeconds": 1782, "remainingSeconds": 17, "totalSamplesScored": 226, "stableForSeconds": 211, "remainingScoringLagSeconds": 88, "awaitingSignificance": false, "partialResults": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "treatmentSamples": 226, "controlSamples": 221, "pValue": 0.004651189571069745}}}
+10:12:29 {"event": "ab-test-results", "abTestId": "agentcore_release_gate_f0112c4a-9e273ddca7", "results": {"showcase_agent_support_workflow-6D9E4mCaGA": {"mean": 1.0, "isSignificant": true, "absoluteChange": 0.08597285067873306, "percentChange": 9.405940594059409, "pValue": 0.004651189571069745, "treatmentSampleSize": 226, "controlSampleSize": 221}}}
+10:12:29 {"event": "quality-gates-passed", "evaluators": ["showcase_agent_support_workflow-6D9E4mCaGA"]}
+10:12:29 {"event": "candidate-promotion-starting", "version": "4"}
+10:13:21 {"event": "candidate-promoted", "version": "4"}
+```
+{% enddetails %}
+
+During the test, `treatment` served agent version 3 and `control` agent version 1. The listing shows runtime versions; the [version table](#agent-and-runtime-versions) maps them to agent versions:
+
+```text
+endpoints: [('treatment', '4', None, 'READY'), ('control', '2', None, 'READY'), ('DEFAULT', '4', None, 'READY')]
+targets: ['control', 'treatment']
+```
+
+The traffic job sent 656 requests. The following answers to "I'd like to send back the mouse from ORD-1004." come from the runtime logs of each endpoint (shortened). Both variants usually read the order and explained that it hasn't been delivered yet. Only the control sometimes asked for a SKU, and in one answer invented an example SKU format:
+
+```text
+treatment: It looks like the order ORD‑1004 is still in the processing stage, so the mouse
+           (item MS‑120) isn't eligible for a return just yet. Return is only possible once
+           the package has been delivered ...
+control:   Sure, I can help with that. To start the return process I'll need the SKU of the
+           mouse you want to send back. Could you let me know the product's SKU (it's
+           usually a code like "MOUSE-1234") from that order?
+```
+
+The following table counts the scored turns by rule, from the evaluation result log groups. It includes 11 control turns that were scored after the decision:
+
+| | Control (version 1) | Treatment (version 3) |
+|---|---|---|
+| Turns that passed | 213 | 226 |
+| Turns that failed | 19 | 0 |
+| Asked the customer for a SKU | 19 | 0 |
+| `create_return` without `check_return_eligibility` | 0 | 0 |
+| Invented identifier | 0 | 0 |
 The following result is the one the action used for its decision:
 
 ```json
-TODO
+"evaluatorMetrics": [{
+  "evaluatorArn": "arn:aws:bedrock-agentcore:eu-central-1:123456789012:evaluator/showcase_agent_support_workflow-6D9E4mCaGA",
+  "controlStats": {"variantName": "C", "sampleSize": 221, "mean": 0.914},
+  "variantResults": [{
+    "variantName": "T1",
+    "sampleSize": 226,
+    "mean": 1.0,
+    "absoluteChange": 0.086,
+    "percentChange": 9.4,
+    "pValue": 0.0047,
+    "confidenceInterval": {"lower": 0.049, "upper": 0.123},
+    "isSignificant": true
+  }]
+}]
 ```
 
-<!-- TODO: treatment mean vs threshold, control mean, p-value. -->
+Treatment scored 1.0, above the threshold of 0.9, and 0.086 higher than the control's 0.914, with a p-value of 0.0047. All three conditions were met, so the action promoted version 3.
 
-After the release, both endpoints serve version 3:
+The difference here is a third of the one in the rollback, and that's what the extra traffic was for. After the first batch of results (61 sessions), the p-value was 0.22. It dropped below 0.05 only after the second batch, with 156 sessions. An earlier release in the same account, with a single customer sending a question every 10 seconds, decided on 15 scored sessions. At that sample size, the action would have rolled back version 3 for lack of evidence.
+
+After the release, both endpoints serve agent version 3:
 
 ```text
-TODO
+endpoints: [('treatment', '4', None, 'READY'), ('control', '4', None, 'READY'), ('DEFAULT', '4', None, 'READY')]
+ab tests: [('agentcore_release_gate_f0112c4a-9e273ddca7', 'ACTIVE', 'STOPPED'), ...]
+eval configs left: ['showcase_agent_control_eval-TIuENTGKTP']
 ```
 
 The A/B test is stopped and remains in AgentCore for later inspection. The two temporary evaluation configurations are deleted, and only the template remains.
 
-If you want a person to approve the promotion, split the job into `step: observe`, `step: promote` and `step: rollback`, and run the promote job in a GitHub environment with required reviewers. The action's README has an example.
-
-## Going further: facts that rules can't check
-
-The four rules catch invented identifiers, but they can't tell whether a date, a price or a weekday in the answer is right. For those facts, the repository includes one LLM-as-a-judge evaluator for on-demand evaluation, `showcase_agent_order_grounding` in `infra/evaluators.tf`. It asks a judge model (`openai.gpt-oss-120b-1:0`, larger than the agent's model, at temperature 0) whether every order fact in the answer comes from a tool result, on a Yes (1.0), Partially (0.5) and No (0.0) scale. Its instructions include the store's policy and the fixed "today", so the judge can check dates without guessing.
-
-`scripts/test_agent.py` invokes the deployed agent with three multi-turn sessions (orders, shipping and returns, five turns each) and prints their session IDs. `scripts/evaluate.py` downloads a session's spans from CloudWatch and calls the `Evaluate` API for each evaluator you pass. Wait 3 to 5 minutes after a session ends, because the spans take that long to reach CloudWatch:
-
-```bash
-uv run scripts/test_agent.py --runtime-arn "$(terraform -chdir=infra output -raw runtime_arn)" --category shipping
-
-uv run scripts/evaluate.py --runtime-id "$(terraform -chdir=infra output -raw runtime_id)" \
-  --session-id "<session-id>" \
-  --evaluators "showcase_agent_order_grounding,Builtin.Faithfulness,Builtin.GoalSuccessRate"
-```
-
-The script resolves custom evaluator names to their IDs, sends the trace IDs of every turn for TRACE evaluators (in batches of 10, the API limit), and saves a Markdown report under `results/` next to the downloaded spans.
-
-We ran it on a shipping session of the agent, on an earlier deployment with different resource IDs:
-
-| Evaluator | Level | Scored | Mean score |
-|---|---|---|---|
-| `showcase_agent_order_grounding` | TRACE | 5 | 0.70 |
-| `Builtin.Faithfulness` | TRACE | 5 | 0.90 |
-| `Builtin.GoalSuccessRate` | SESSION | 1 | 1.00 |
-
-The session achieved its goals, and the tracking number, carrier and delivery estimate were all correct. The last answer said that ORD-1001 was delivered on "Friday, 14 September 2026". The date comes from the tool result. The weekday is invented: 2026-09-14 is a Monday, and no tool returned a weekday. The custom grounding evaluator flagged it:
-
-```text
-Partially (0.5): ... The day-of-week 'Friday' is not present in any tool result — it is derived
-by the agent independently. However, 14 September 2026 does indeed fall on a Monday, not a
-Friday, making this an invented and incorrect fact not grounded in any tool result.
-```
-
-The grounding evaluator also lowered the first turn, where the agent suggested that ORD-1002 was "usually the most recent one" although ORD-1004 is newer, and the second turn, where it assumed the keyboard was in ORD-1002 without reading the order. `Builtin.Faithfulness` rated the weekday turn Generally Yes (0.75). The custom evaluator lists exactly which facts must come from tools, so it scores invented details more strictly.
-
-The release gate's rules passed every turn of that session: every identifier in the answers came from a tool. The judge found what the rules can't express. Once you trust a judge like this one, you can add it to the online evaluation configuration and to `quality-gates`, and accept its cost on every scored session.
-
-## Lessons learned
-
-The showcase surfaced the following lessons:
-
-- **Encode the workflow, not the change.** The evaluator's rules come from how the store wants support to work. They caught a regression that nobody wrote them for, and they keep working for future releases.
-- **Measure a candidate locally before you release it.** Running both prompts against the same questions with the evaluator's rules showed, in minutes, whether the A/B test could detect the difference. A difference smaller than what the observation window can measure leads to a rollback for lack of significance, not for quality.
-- **With significance required, only improvements get promoted.** A candidate as good as the control is rolled back. Turn off `require-significance` if you want to release changes that only have to not be worse.
-- **Send traffic through the gateway during the test.** The action scores only the sessions that go through the gateway while the test runs, and it promotes only with scored sessions.
-- **Scores arrive late, in batches.** A session is scored after it has been idle for the configured timeout (2 minutes here), plus processing time, and online evaluation delivers the scores in batches about every 5 minutes. With `scoring-lag-seconds` at 300, the count never stayed stable long enough, and the action decided at its 30-minute evaluation timeout with all the scored sessions. For a real release, keep the default observation of 2 hours.
-- **Raise the Lambda concurrency quota for code-based evaluators.** Online evaluation invokes the evaluator for a whole batch of sessions at once. With the default quota of 10 concurrent executions for new accounts, about a third of the evaluations were throttled and never scored. Request a higher quota in Service Quotas (Lambda, Concurrent executions) before you rely on a code-based gate.
-- **Quality gates need full evaluator IDs.** The suffix changes if you recreate the evaluator.
-- **Names around the control endpoint must contain `control`**, because the action builds the treatment names by replacing it with `treatment`.
-- **Terraform must ignore the runtime image and the endpoint version**, or it undoes the releases.
-- **Size the traffic for the difference you expect.** Version 3 is better than version 1 by about 0.1 on a 0-to-1 score. With one customer sending a question every 10 seconds, each variant gets only a few scored sessions in 15 minutes, too few for a significant result. With four customers in parallel, the rollback decision used 380 scored sessions.
-- **Failed requests are invisible to the evaluator.** Requests fail when the model returns an invalid tool name. They produce no answer to score, so a version that fails more often isn't penalized by a quality evaluator. Watch the error rate separately.
-
-For production, we recommend the following:
-
-- Keep the defaults: `duration-seconds: 7200` and an 80/20 split.
-- Use real user traffic.
-- Add more evaluators to the template configuration and to `quality-gates`.
-- Pin the action to a commit SHA, as in the workflow above.
-- Keep the `concurrency` group, so two releases never use the same gateway at the same time.
-- Make sure that `role-duration-seconds` and the role's `MaxSessionDuration` cover the whole test.
-- If the workflow runs on pull requests, pass `github-token` (with `pull-requests: write`) so the action comments the result on the pull request.
-
-## Clean up
-
-To avoid recurring charges, clean up your AWS account after trying the solution. The action creates the `treatment` endpoint, the `treatment` gateway target and the A/B tests itself, so Terraform doesn't manage them. Delete the stopped A/B tests of the gateway with the `DeleteABTest` API (for example, `boto3.client("bedrock-agentcore").delete_ab_test(abTestId=...)`), delete the `treatment` target and endpoint, and then run `terraform destroy`:
-
-```bash
-aws bedrock-agentcore-control list-gateway-targets --gateway-identifier <gateway-id>
-aws bedrock-agentcore-control delete-gateway-target --gateway-identifier <gateway-id> --target-id <treatment-target-id>
-aws bedrock-agentcore-control delete-agent-runtime-endpoint --agent-runtime-id <runtime-id> --endpoint-name treatment
-terraform -chdir=infra destroy
-```
-
-AgentCore creates some log groups itself, so Terraform doesn't delete them: the online evaluation results (`/aws/bedrock-agentcore/evaluations/results/<config-id>`, one per configuration, including the per-variant copies of an A/B release) and the log group of the runtime's `DEFAULT` endpoint. List and delete them:
-
-```bash
-aws logs describe-log-groups --log-group-name-prefix /aws/bedrock-agentcore/evaluations/results/showcase_agent \
-  --query 'logGroups[].logGroupName' --output text
-aws logs describe-log-groups --log-group-name-prefix /aws/bedrock-agentcore/runtimes/showcase_agent \
-  --query 'logGroups[].logGroupName' --output text
-aws logs delete-log-group --log-group-name <log-group-name>
-```
-
-The local `results/` folder contains the downloaded spans and evaluation reports, and is ignored by Git.
+The action also supports a manual approval: `step: observe`, `step: promote` and `step: rollback` split a release into jobs, and a GitHub environment with required reviewers protects the promote job. The action's README has an example.
 
 ## Conclusion
 
-In this post, we showed how to release a new version of an Amazon Bedrock AgentCore agent only after it outperforms the current version on live traffic, and how the same gate rolls back a change that looks harmless and makes the agent worse.
+In this post, I showed how the AgentCore A/B Release Gate releases a new version of an Amazon Bedrock AgentCore agent only after it outperforms the current version on live traffic, and how the same gate rolls back a change that makes the agent worse.
 
-AgentCore Runtime endpoints, an AgentCore Gateway A/B test and online evaluation work together with the AgentCore A/B Release Gate GitHub Action to deploy a candidate, score both variants, and decide based on statistically significant results. A deterministic, code-based evaluator that encodes the store's support workflow as four rules made the decision: it rolled back a latency optimization that opened returns without checking eligibility first, and it promoted a prompt fix that stopped the agent from asking customers for SKUs. For the facts that rules can't check, an LLM-as-a-judge evaluator runs on demand.
-
-To get started, deploy the showcase from the repository, change the system prompt, push to `main` to watch the release gate decide, and replace the rules with the ones your own agents must follow.
+AgentCore Runtime endpoints, an AgentCore Gateway A/B test and online evaluation work together with the action to deploy a candidate, score both variants, and decide based on statistically significant results. A deterministic, code-based evaluator that encodes the store's support workflow as four rules made the decision: it rolled back a latency optimization that opened returns without checking eligibility first (0.649 against 0.924), and it promoted a prompt fix that stopped the agent from asking customers for SKUs (1.0 against 0.914).
 
 ## Resources
 
 - The action: [alvarog2491/agentcore-ab-release-gate](https://github.com/alvarog2491/agentcore-ab-release-gate)
 - The showcase: [alvarog2491/agentcore-release-showcase](https://github.com/alvarog2491/agentcore-release-showcase)
-- AWS documentation: [A/B testing](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/ab-testing.html), [A/B tests with target-based routing](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/ab-testing-target-based.html), [A/B testing prerequisites](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/ab-testing-prereqs.html), [Code-based evaluators](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/code-based-evaluators.html), [Getting started with on-demand evaluation](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/getting-started-on-demand.html)
+- AWS documentation: [A/B testing](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/ab-testing.html), [A/B tests with target-based routing](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/ab-testing-target-based.html), [A/B testing prerequisites](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/ab-testing-prereqs.html), [Code-based evaluators](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/code-based-evaluators.html)
