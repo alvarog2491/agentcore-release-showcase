@@ -2,31 +2,43 @@
 
 Showcase of the
 [AgentCore A/B Release Gate](https://github.com/alvarog2491/agentcore-ab-release-gate)
-GitHub Action. A customer-support agent on Amazon Bedrock AgentCore is
-released through a live A/B test, and a deterministic, code-based evaluator
-decides whether each new version is promoted or rolled back.
+GitHub Action: a customer-support agent on Amazon Bedrock AgentCore, released
+through a live A/B test and gated by a code-based evaluator.
 
-The walkthrough is published on dev.to:
-[Gating AI agent releases on Amazon Bedrock AgentCore with A/B tests and a code-based evaluator](docs/devto-agentcore-release-and-evaluation.md).
+Two releases ran: a latency optimization was rolled back and a prompt fix was
+promoted. The full write-up is on
+[dev.to](https://dev.to/alvarog2491/releasing-and-evaluating-ai-agents-on-amazon-bedrock-agentcore-with-ab-tests-and-explainability-2hp9).
 
-## Results
+## Tech stack
 
-Two releases run against the same baseline. A latency optimization that skips
-the return eligibility check is rolled back, and a prompt fix that reads SKUs
-from the order is promoted.
-
-| Release | Control | Treatment | p-value | Result |
-|---|---|---|---|---|
-| Latency optimization | 0.924 | 0.649 | 6.3e-9 | Rolled back |
-| SKU fix | 0.914 | 1.00 | 0.0047 | Promoted |
-
-## Contents
-
-| Path | Contents |
+| Layer | Technology |
 |---|---|
-| `src/agent/` | The agent: LangGraph with Amazon Bedrock, served by AgentCore Runtime |
-| `src/evaluators/` | The code-based evaluator that scores each turn against the store's support workflow |
-| `infra/` | Terraform for the runtime, gateway, evaluators and IAM roles the action uses |
-| `.github/workflows/` | The release workflow: build, A/B release gate and traffic |
-| `scripts/` | Traffic generation, test sessions and on-demand evaluations |
-| `docs/` | The dev.to post |
+| Agent | Python, LangGraph, LangChain AWS (`ChatBedrockConverse`) |
+| Model | `openai.gpt-oss-20b` on Amazon Bedrock |
+| Hosting | Amazon Bedrock AgentCore Runtime (ARM64 container in Amazon ECR) and an HTTP AgentCore Gateway |
+| Evaluation | AgentCore online evaluations with a code-based evaluator on AWS Lambda (Python 3.13) |
+| Observability | OpenTelemetry (ADOT), Amazon CloudWatch and AWS X-Ray |
+| Infrastructure | Terraform (AWS provider 6.x), deployed to `eu-central-1` |
+| CI/CD | GitHub Actions with OIDC and the AgentCore A/B Release Gate action |
+| Tooling | uv workspace, Docker |
+
+## Structure
+
+```
+.
+├── src/
+│   ├── agent/          # LangGraph agent with Amazon Bedrock, served by AgentCore Runtime
+│   └── evaluators/     # Code-based evaluator (Lambda) that gates each release
+├── infra/              # Terraform: runtime, gateway, evaluators, IAM roles
+├── .github/workflows/  # Release workflow: build, A/B release gate, traffic
+├── scripts/            # Traffic generation, test sessions, on-demand evaluations
+└── docs/               # Source of the dev.to post
+```
+
+## Learn more
+
+The [dev.to post](https://dev.to/alvarog2491/releasing-and-evaluating-ai-agents-on-amazon-bedrock-agentcore-with-ab-tests-and-explainability-2hp9)
+covers the deployment, both release runs and the evaluator in detail. The
+release gate itself lives in the
+[AgentCore A/B Release Gate](https://github.com/alvarog2491/agentcore-ab-release-gate)
+repository.
